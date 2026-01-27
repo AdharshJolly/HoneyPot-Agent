@@ -107,6 +107,19 @@ class Session:
     # Redundancy tracking (Option B)
     redundantScammerMessageCount: int = 0
     hasSufficientIntelligence: bool = False
+    
+    # Conversation Pacing Control (Task 1)
+    stateTurnCount: Dict[str, int] = field(default_factory=lambda: {
+        "INIT": 0, "CONFUSED": 0, "TRUST_BUILDING": 0, 
+        "INFORMATION_EXTRACTION": 0, "EXIT": 0
+    })
+    stallCount: int = 0  # Number of stall tactics used
+    
+    # Repetition Fatigue (Tone Control)
+    repetitionFatigueLevel: int = 0  # 0-3 scale: normal -> fatigued
+    
+    # Behavioral Realism (Option C)
+    responseStrategy: str = "CONFUSED_CLARIFICATION"
 
     # Terminal flags (irreversible once true)
     callbackSent: bool = False

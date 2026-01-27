@@ -94,6 +94,10 @@ class AgentController:
         AgentState.EXIT: set(),  # Terminal state, no transitions allowed
     }
 
+    # Readiness thresholds (signal-driven, not turn-driven)
+    READINESS_THRESHOLD_TRUST = 3
+    READINESS_THRESHOLD_EXTRACTION = 6
+
     def __init__(self):
         """Initialize controller with reply templates."""
         # WHY templates: Ensures human-like, consistent persona
@@ -144,6 +148,34 @@ class AgentController:
             ],
         }
 
+        # TERMINAL STATE PROTECTION: Cannot transition out of EXIT
+        if current == AgentState.EXIT:
+            return AgentState.EXIT.value
+
+        # --- PACING CONTROL (TASK 1) ---
+        # Minimum dwell times (agent turns) per state
+        MIN_DWELL = {
+            AgentState.CONFUSED: 2,
+            AgentState.TRUST_BUILDING: 3,
+            AgentState.INFORMATION_EXTRACTION: 2,
+        }
+
+        # Check current state dwell time
+        # Note: state_turn_count passed from external session logic or tracked here?
+        # The prompt says "Store counters in SessionManager".
+        # But AgentController is stateless. We need these counters passed in.
+        # Assuming we need to extend arguments or rely on message_count heuristics if pure stateless.
+        # Wait, I can't modify SessionManager methods in this tool call, but I can assume the values are passed
+        # or I can't easily access them without changing the signature again.
+        # The previous instruction updated `session.py` to add fields.
+        # I need to update `decide_next_state` signature to accept these counters.
+
+        # BUT I can't update main.py in the same turn easily to pass them.
+        # Actually, I can update the signature here, and then main.py.
+
+        # Let's proceed with adding arguments to `decide_next_state`
+        pass
+
     def decide_next_state(
         self,
         current_state: str,
@@ -151,63 +183,56 @@ class AgentController:
         message_count: int,
         extracted_intelligence: Dict[str, List[str]],
         redundant_count: int = 0,
+        current_state_turns: int = 0,  # NEW: Current state dwell time
+        stall_count: int = 0,  # NEW: Total stall tactics used
     ) -> str:
         """
-        Determine the next agent state based on current state and observed signals.
-
-        WHY signal-driven:
-        - Deterministic transitions based on observable events
-        - Not dependent on LLM interpretation
-        - Auditable decision trail
-
-        WHY extracted_intelligence and redundant_count:
-        - Enables sophisticated exit logic (Categories A, B, C)
-        - Prevents premature exit
-
-        Args:
-            current_state: Current agentState (string from session)
-            signals: List of TransitionSignal values detected
-            message_count: Total messages in conversation
-            extracted_intelligence: Dictionary of list of extracted artifacts
-            redundant_count: Number of redundant scammer messages tracked
-
-        Returns:
-            Next state name (string)
-
-        Raises:
-            ValueError: If transition is illegal
+        Determine next agent state with pacing and dwell time enforcement.
         """
         try:
             current = AgentState(current_state)
         except ValueError:
             raise ValueError(f"Invalid current state: {current_state}")
 
-        # TERMINAL STATE PROTECTION: Cannot transition out of EXIT
         if current == AgentState.EXIT:
             return AgentState.EXIT.value
-            
-        # CHECK EXIT CONDITIONS (Categories A + B + C)
+
+        # --- PACING & DWELL TIME ENFORCEMENT ---
+        min_dwell = {
+            AgentState.CONFUSED: 2,
+            AgentState.TRUST_BUILDING: 3,
+            AgentState.INFORMATION_EXTRACTION: 2,
+        }.get(current, 0)
+
+        # Force remain in state if dwell time not met
+        # Exception: Critical scam detection in INIT should move to CONFUSED immediately
+        if current != AgentState.INIT and current_state_turns < min_dwell:
+            return current.value
+
+        # --- EXIT LOGIC (TASK 4) ---
+        # Exit only if:
+        # 1. Categories A+B+C satisfied (via _should_exit)
+        # 2. At least one stall response used (stall_count > 0)
         if self._should_exit(extracted_intelligence, message_count, redundant_count):
-            return AgentState.EXIT.value
+            if stall_count >= 1:
+                return AgentState.EXIT.value
+            # If ready to exit but haven't stalled, maybe next turn?
+            # Or forces transition logic below to handle it.
+            # Actually, if we are in EXTRACTION and ready to exit but haven't stalled,
+            # we should stay in EXTRACTION (which might trigger a stall reply via reply_service).
+            pass
 
         # Determine next state based on current state and signals
+        intelligence_count = sum(len(v) for v in extracted_intelligence.values())
         next_state = self._evaluate_transition(
-            current, signals, message_count, 0 # intelligence_count unused in new logic, passing 0
+            current, signals, message_count, intelligence_count, redundant_count
         )
 
-        # TRANSITION LEGALITY CHECK: Enforce allowed transitions
-        if next_state not in self.ALLOWED_TRANSITIONS[current] and next_state != current:
-             # Allow staying in same state, but if it changed, must be allowed
-             # Actually, ALLOWED_TRANSITIONS only lists *changes*.
-             # The logic below handles the check.
-             pass
-
-        # If state changed, validate it is allowed
+        # TRANSITION LEGALITY CHECK
         if next_state != current:
-             if next_state not in self.ALLOWED_TRANSITIONS[current]:
+            if next_state not in self.ALLOWED_TRANSITIONS[current]:
                 raise ValueError(
-                    f"Illegal state transition: {current.value} → {next_state.value}. "
-                    f"Allowed transitions: {[s.value for s in self.ALLOWED_TRANSITIONS[current]]}"
+                    f"Illegal state transition: {current.value} → {next_state.value}"
                 )
 
         return next_state.value
@@ -217,31 +242,40 @@ class AgentController:
     ) -> bool:
         """
         Evaluate strict exit conditions (Categories A, B, C).
-        
+
         Returns True ONLY if all categories are satisfied.
         """
         # CATEGORY A: High-Value Intelligence Presence (REQUIRED)
         has_high_value = (
-            len(intel.get("bankAccounts", [])) > 0 or 
-            len(intel.get("upiIds", [])) > 0 or 
-            len(intel.get("phishingLinks", [])) > 0 or 
-            len(intel.get("phoneNumbers", [])) > 0
+            len(intel.get("bankAccounts", [])) > 0
+            or len(intel.get("upiIds", [])) > 0
+            or len(intel.get("phishingLinks", [])) > 0
+            or len(intel.get("phoneNumbers", [])) > 0
         )
+        # EXIT requires at least one extracted artifact
         if not has_high_value:
+            return False
+
+        # EXIT requires meaningful engagement (avoid early exits)
+        if message_count < 4:
             return False
 
         # CATEGORY B: Evidence Sufficiency (REQUIRED)
         # 1. Multi-modal (more than 1 type)
-        types_count = sum([
-            1 if len(intel.get("bankAccounts", [])) > 0 else 0,
-            1 if len(intel.get("upiIds", [])) > 0 else 0,
-            1 if len(intel.get("phishingLinks", [])) > 0 else 0,
-            1 if len(intel.get("phoneNumbers", [])) > 0 else 0
-        ])
+        types_count = sum(
+            [
+                1 if len(intel.get("bankAccounts", [])) > 0 else 0,
+                1 if len(intel.get("upiIds", [])) > 0 else 0,
+                1 if len(intel.get("phishingLinks", [])) > 0 else 0,
+                1 if len(intel.get("phoneNumbers", [])) > 0 else 0,
+            ]
+        )
         # 2. OR Redundancy (implies same artifact across turns)
         # 3. OR Minimum turns (default 6)
-        is_sufficient = (types_count > 1) or (redundant_count > 0) or (message_count >= 6)
-        
+        is_sufficient = (
+            (types_count > 1) or (redundant_count > 0) or (message_count >= 6)
+        )
+
         if not is_sufficient:
             return False
 
@@ -250,25 +284,8 @@ class AgentController:
         # 2. OR Redundant messages (implies repeated intent/urgency)
         keyword_count = len(intel.get("suspiciousKeywords", []))
         has_pressure = (keyword_count >= 2) or (redundant_count > 0)
-        
+
         return has_pressure
-
-        # TRANSITION LEGALITY CHECK: Enforce allowed transitions
-        if next_state not in self.ALLOWED_TRANSITIONS[current] and next_state != current:
-             # Allow staying in same state, but if it changed, must be allowed
-             # Actually, ALLOWED_TRANSITIONS only lists *changes*.
-             # The logic below handles the check.
-             pass
-
-        # If state changed, validate it is allowed
-        if next_state != current:
-             if next_state not in self.ALLOWED_TRANSITIONS[current]:
-                raise ValueError(
-                    f"Illegal state transition: {current.value} → {next_state.value}. "
-                    f"Allowed transitions: {[s.value for s in self.ALLOWED_TRANSITIONS[current]]}"
-                )
-
-        return next_state.value
 
     def _evaluate_transition(
         self,
@@ -276,72 +293,121 @@ class AgentController:
         signals: List[str],
         message_count: int,
         intelligence_count: int,
+        redundant_count: int,
     ) -> AgentState:
         """
-        Evaluate which transition should occur based on current state and signals.
+        Evaluate which transition should occur based on accumulated readiness signals.
 
-        WHY this logic:
-        - Maps signals to state transitions per agent_state_machine.md
-        - Adds safety timeouts to prevent infinite engagement
-        - Prioritizes intelligence extraction goals
-
-        Returns:
-            Next AgentState (may be same as current if no transition triggered)
+        State progression is driven by readiness score (signals + artifacts + pressure),
+        not turn count. Keeps cautious progression for subtle scammers and accelerates
+        for pushy ones.
         """
-        # Convert string signals to enum for type safety
-        signal_set = set()
+        signal_set = self._to_signal_set(signals)
+        readiness = self._compute_readiness(
+            signal_set, intelligence_count, message_count, redundant_count
+        )
+
+        # INIT → CONFUSED only after scam detected
+        if current == AgentState.INIT:
+            if TransitionSignal.SCAM_DETECTED in signal_set:
+                return AgentState.CONFUSED
+            return current
+
+        # CONFUSED progression: can only advance to TRUST_BUILDING (never directly to extraction)
+        if current == AgentState.CONFUSED:
+            if readiness >= self.READINESS_THRESHOLD_TRUST:
+                return AgentState.TRUST_BUILDING
+            return AgentState.CONFUSED
+
+        # TRUST_BUILDING progression: may enter extraction once readiness + evidence satisfied
+        if current == AgentState.TRUST_BUILDING:
+            if self._can_enter_extraction(signal_set, intelligence_count, readiness):
+                return AgentState.INFORMATION_EXTRACTION
+            return AgentState.TRUST_BUILDING
+
+        # INFORMATION_EXTRACTION: remain until exit conditions satisfied elsewhere
+        if current == AgentState.INFORMATION_EXTRACTION:
+            # If scammer disengages and we already have intel, allow graceful exit
+            if (
+                TransitionSignal.SCAMMER_DISENGAGED in signal_set
+                and intelligence_count > 0
+            ):
+                return AgentState.EXIT
+            return AgentState.INFORMATION_EXTRACTION
+
+        return current
+
+    def _to_signal_set(self, signals: List[str]) -> Set[TransitionSignal]:
+        signal_set: Set[TransitionSignal] = set()
         for sig in signals:
             try:
                 signal_set.add(TransitionSignal(sig))
             except ValueError:
-                # Ignore unknown signals (defensive programming)
-                pass
+                # Ignore unknown signals
+                continue
+        return signal_set
 
-        # INIT → CONFUSED: Triggered when scam detected
-        if current == AgentState.INIT:
-            if TransitionSignal.SCAM_DETECTED in signal_set:
-                return AgentState.CONFUSED
-            return current  # Stay in INIT until scam confirmed
+    def _compute_readiness(
+        self,
+        signal_set: Set[TransitionSignal],
+        intelligence_count: int,
+        message_count: int,
+        redundant_count: int,
+    ) -> int:
+        """Calculate readiness score from accumulated observable signals."""
+        score = 0
 
-        # CONFUSED → TRUST_BUILDING: Triggered by urgency or payment request
-        if current == AgentState.CONFUSED:
-            if (
-                TransitionSignal.URGENCY_DETECTED in signal_set
-                or TransitionSignal.PAYMENT_REQUEST in signal_set
-            ):
-                return AgentState.TRUST_BUILDING
-            # Stay CONFUSED for 2-3 turns to prolong engagement
-            if message_count >= 4:
-                return AgentState.TRUST_BUILDING
-            return current
+        # Core scam confirmation
+        if TransitionSignal.SCAM_DETECTED in signal_set:
+            score += 1
 
-        # TRUST_BUILDING → INFORMATION_EXTRACTION: Triggered by artifact sharing
-        if current == AgentState.TRUST_BUILDING:
-            if TransitionSignal.ARTIFACTS_SHARED in signal_set:
-                return AgentState.INFORMATION_EXTRACTION
-            # Auto-transition after sufficient turns
-            if message_count >= 6:
-                return AgentState.INFORMATION_EXTRACTION
-            return current
+        # Urgency / payment pressure
+        if TransitionSignal.URGENCY_DETECTED in signal_set:
+            score += 2
+        if TransitionSignal.PAYMENT_REQUEST in signal_set:
+            score += 2
 
-        # INFORMATION_EXTRACTION → EXIT: Triggered by intelligence threshold or disengagement
-        if current == AgentState.INFORMATION_EXTRACTION:
-            # Exit if intelligence goals met
-            if TransitionSignal.INTELLIGENCE_THRESHOLD_MET in signal_set:
-                return AgentState.EXIT
-            # Exit if scammer disengaged
-            if TransitionSignal.SCAMMER_DISENGAGED in signal_set:
-                return AgentState.EXIT
-            # Exit after extracting sufficient intelligence (3+ items)
-            if intelligence_count >= 3:
-                return AgentState.EXIT
-            # Safety timeout: Exit after prolonged extraction phase
-            if message_count >= 12:
-                return AgentState.EXIT
-            return current
+        # Repeated demands / pushiness
+        if redundant_count > 0:
+            score += min(3, 1 + redundant_count)  # cap to avoid runaway
 
-        # Default: No transition
-        return current
+        # Voluntary disclosure (artifacts or extracted intel)
+        if TransitionSignal.ARTIFACTS_SHARED in signal_set:
+            score += 3
+        if intelligence_count > 0:
+            score += 2
+        if intelligence_count > 2:
+            score += 1
+
+        # Pressure escalation combos
+        if (
+            TransitionSignal.URGENCY_DETECTED in signal_set
+            and TransitionSignal.PAYMENT_REQUEST in signal_set
+        ):
+            score += 1
+        if redundant_count >= 2:
+            score += 1
+
+        # Agent acknowledgement (indicates engagement is happening)
+        if message_count >= 2:
+            score += 1
+        if message_count >= 4:
+            score += 1
+
+        return score
+
+    def _can_enter_extraction(
+        self,
+        signal_set: Set[TransitionSignal],
+        intelligence_count: int,
+        readiness: int,
+    ) -> bool:
+        """Gate entry into INFORMATION_EXTRACTION with readiness + evidence."""
+        has_artifact_signal = TransitionSignal.ARTIFACTS_SHARED in signal_set
+        has_any_intel = intelligence_count > 0
+        return readiness >= self.READINESS_THRESHOLD_EXTRACTION and (
+            has_artifact_signal or has_any_intel
+        )
 
     def generate_reply(self, state: str, scammer_message: Optional[str] = None) -> str:
         """

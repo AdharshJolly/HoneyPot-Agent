@@ -18,9 +18,6 @@ import os
 import random
 from typing import Optional, List
 import logging
-
-import requests
-
 import requests
 
 # Configure logging
@@ -66,6 +63,36 @@ class AgentReplyService:
             "busy_professional": "You are a busy professional. You are rushed and annoyed. You want to resolve this quickly. You use short sentences.",
             "naive_student": "You are a university student. You are fearful of losing money. You are eager to comply but easily confused.",
             "skeptical_user": "You are a cautious user. You suspect something might be wrong but you are curious. You ask for proof.",
+        }
+        
+        # Fatigued/Disengaged templates (Fatigue Level >= 2)
+        # Used across personas when pressure becomes repetitive
+        self._fatigued_templates = [
+            "I really can't deal with this right now.",
+            "I've already said I need time.",
+            "This is too much for me at the moment.",
+            "Please stop rushing me.",
+            "I can't do this right now.",
+            "I'm getting confused, just wait.",
+        ]
+        
+        # Strategy-Specific Templates (Tone Control)
+        self._strategy_templates = {
+            "GUARDED_RESISTANCE": [
+                "I don't usually share details over messages.",
+                "This doesn't sound like how my bank contacts me.",
+                "I need to be sure who I'm talking to.",
+                "My son told me never to share code.",
+                "I'm not comfortable doing this so quickly.",
+            ],
+            "STRATEGIC_DELAY": [
+                "I don't have my passbook with me.",
+                "My son handles these things, I'll ask him.",
+                "I'm outside right now, can't check.",
+                "I'm driving, message later.",
+                "Let me find my glasses first.",
+                "The internet is very slow here."
+            ]
         }
 
         # Persona-specific fallback templates per state
@@ -200,6 +227,8 @@ class AgentReplyService:
         scammer_message: str,
         persona_name: str = "confused_elderly",
         recent_user_context: Optional[List[str]] = None,
+        fatigue_level: int = 0,
+        response_strategy: str = "CONFUSED_CLARIFICATION",
     ) -> str:
         """
         Generate a reply based on state, input, and persona.
@@ -209,6 +238,8 @@ class AgentReplyService:
             scammer_message: The trigger message to reply to.
             persona_name: The immutable session persona.
             recent_user_context: List of recent messages from the scammer for context.
+            fatigue_level: 0-3 scale indicating repetition fatigue.
+            response_strategy: High-level tone/tactic (e.g. STRATEGIC_DELAY).
 
         Returns:
             A single string reply.
@@ -218,11 +249,27 @@ class AgentReplyService:
         if agent_state == "INIT":
             return ""
 
+        # TASK 2: Hard Stop for CONFUSED Loops
+        # If strategy is still confusion but we've had multiple exchanges, force resistance
+        effective_strategy = response_strategy
+        if (
+            response_strategy == "CONFUSED_CLARIFICATION"
+            and recent_user_context
+            and len(recent_user_context) >= 2
+        ):
+            logger.info("Confusion limit reached. Forcing GUARDED_RESISTANCE override.")
+            effective_strategy = "GUARDED_RESISTANCE"
+
         # Attempt LLM generation if enabled
         if self.use_llm:
             try:
                 return self._generate_with_llm(
-                    agent_state, scammer_message, persona_name, recent_user_context
+                    agent_state,
+                    scammer_message,
+                    persona_name,
+                    recent_user_context,
+                    fatigue_level,
+                    effective_strategy,
                 )
             except Exception as e:
                 # STRICT MODE: Crash if generation fails
@@ -233,7 +280,11 @@ class AgentReplyService:
                 # Log failure and fallback to templates
                 logger.error(f"LLM generation failed: {e}. Falling back to templates.")
                 return self._generate_with_templates(
-                    agent_state, scammer_message, persona_name
+                    agent_state,
+                    scammer_message,
+                    persona_name,
+                    fatigue_level,
+                    effective_strategy,
                 )
 
         # Check strict mode violation (LLM disabled but strict mode is on)
@@ -241,24 +292,24 @@ class AgentReplyService:
             raise ValueError("STRICT_LLM_MODE active but LLM disabled.")
 
         # Fallback to templates for all other cases (USE_LLM=False)
-        return self._generate_with_templates(agent_state, scammer_message, persona_name)
+        return self._generate_with_templates(
+            agent_state,
+            scammer_message,
+            persona_name,
+            fatigue_level,
+            effective_strategy,
+        )
 
     def _generate_with_templates(
         self,
         agent_state: str,
         scammer_message: str = "",
         persona_name: str = "confused_elderly",
+        fatigue_level: int = 0,
+        response_strategy: str = "CONFUSED_CLARIFICATION",
     ) -> str:
         """
         Deterministic fallback generation with persona and context awareness.
-
-        Args:
-            agent_state: The behavioral state (CONFUSED, TRUST_BUILDING, etc.)
-            scammer_message: Latest scammer message for lightweight context matching
-            persona_name: The session persona
-
-        Returns:
-            Persona-appropriate, context-sensitive template reply
         """
         # Improved EXIT templates for deterministic "memory" feel
         if agent_state == "EXIT":
@@ -266,10 +317,21 @@ class AgentReplyService:
                 "confused_elderly": "As I said, I need to ask my son about this. I'm hanging up now.",
                 "busy_professional": "Like I mentioned, I'll verify this through official channels. Goodbye.",
                 "naive_student": "I'm going to call my parents like I said. Bye.",
-                "skeptical_user": "I told you I don't trust this. I'm verifying independently. Bye."
+                "skeptical_user": "I told you I don't trust this. I'm verifying independently. Bye.",
             }
             return exit_templates.get(persona_name, "I need to go now. Goodbye.")
 
+        # 1. FATIGUE OVERRIDE (Highest Priority)
+        # If fatigue is high (>=2), use short, disengaged replies
+        if fatigue_level >= 2 or response_strategy == "FATIGUED_DISENGAGEMENT":
+            return random.choice(self._fatigued_templates)
+
+        # 2. STRATEGY OVERRIDE
+        # If strategy suggests specific phrasing (Resistance/Delay), prefer those templates
+        if response_strategy in self._strategy_templates:
+            return random.choice(self._strategy_templates[response_strategy])
+
+        # 3. STATE/PERSONA FALLBACK
         # Get templates for this state and persona
         state_templates = self._fallback_templates.get(agent_state)
         if not state_templates:
@@ -285,86 +347,78 @@ class AgentReplyService:
         # Lightweight context sensitivity (keyword matching only)
         # No semantic parsing, no inference
         filtered_templates = self._filter_templates_by_context(
-            persona_templates, scammer_message, agent_state
+            persona_templates, scammer_message
         )
 
         # Select randomly from available templates
         return random.choice(filtered_templates)
 
     def _filter_templates_by_context(
-        self, templates: List[str], scammer_message: str, agent_state: str
+        self, templates: List[str], scammer_message: str, max_candidates: int = 5
     ) -> List[str]:
         """
-        Filter templates based on obvious scammer message cues.
-
-        Lightweight branching: only keyword matching, no inference.
-
-        Args:
-            templates: Available templates for this state/persona
-            scammer_message: Latest message from scammer
-            agent_state: Current state
-
-        Returns:
-            Filtered list of relevant templates (or original if no match)
+        Filters templates based on obvious cues in the scammer message.
         """
         if not scammer_message:
-            return templates
+            return templates[:max_candidates]
 
-        message_lower = scammer_message.lower()
+        msg_lower = scammer_message.lower()
 
-        # Detect obvious cues (simple substring matching)
+        # Obvious cues
         has_link = any(
-            word in message_lower for word in ["link", "http", "www", "visit", "click"]
-        )
-        has_account = any(
-            word in message_lower for word in ["account", "bank", "upi", "transfer"]
+            word in msg_lower for word in ["link", "http", "www", "visit", "click"]
         )
         has_payment = any(
-            word in message_lower
-            for word in ["pay", "payment", "send", "upi", "paytm", "gpay"]
+            word in msg_lower
+            for word in ["pay", "payment", "send", "upi", "paytm", "gpay", "transfer"]
+        )
+        has_account = any(
+            word in msg_lower for word in ["account", "bank", "kyc", "verify", "identity"]
         )
 
-        # INFORMATION_EXTRACTION and TRUST_BUILDING: Use context-relevant templates
-        if agent_state == "INFORMATION_EXTRACTION":
-            if has_link:
-                # Prefer templates asking about link
-                link_related = [
+        filtered = []
+
+        if has_link:
+            filtered.extend(
+                [
                     t
                     for t in templates
-                    if any(w in t.lower() for w in ["link", "send"])
+                    if any(w in t.lower() for w in ["link", "site", "page", "open"])
                 ]
-                if link_related:
-                    return link_related
-            if has_account or has_payment:
-                # Prefer templates asking about account/UPI/details
-                detail_related = [
+            )
+
+        if has_payment or has_account:
+            filtered.extend(
+                [
                     t
                     for t in templates
                     if any(
-                        w in t.lower() for w in ["upi", "account", "number", "repeat"]
+                        w in t.lower()
+                        for w in ["account", "bank", "upi", "pay", "number", "code"]
                     )
                 ]
-                if detail_related:
-                    return detail_related
+            )
 
-        if agent_state == "TRUST_BUILDING":
-            if has_link or has_account:
-                # Prefer templates asking for verification
-                verify_related = [
-                    t
-                    for t in templates
-                    if any(
-                        w in t.lower() for w in ["verify", "proof", "official", "real"]
-                    )
-                ]
-                if verify_related:
-                    return verify_related
+        # If no specific matches, return original list (limited by max_candidates)
+        if not filtered:
+            return templates[:max_candidates]
 
-        # Default: use all templates (random selection)
-        return templates
+        # Remove duplicates while preserving order
+        unique_filtered = []
+        for t in filtered:
+            if t not in unique_filtered:
+                unique_filtered.append(t)
+
+        return unique_filtered[:max_candidates]
 
     def _generate_with_llm(
-        self, agent_state: str, scammer_message: str, persona_name: str, recent_user_context: Optional[List[str]] = None
+        self,
+        agent_state: str,
+        scammer_message: str,
+        persona_name: str,
+        recent_user_context: Optional[List[str]] = None,
+        fatigue_level: int = 0,
+        response_strategy: str = "CONFUSED_CLARIFICATION",
     ) -> str:
         """
         Generate reply using LLM (Real local or Mock API).
@@ -379,36 +433,63 @@ class AgentReplyService:
 
         context_str = ""
         if recent_user_context:
-            context_str = "Recent User Messages:\n" + "\n".join([f"- {msg}" for msg in recent_user_context])
+            context_str = "Recent Conversation History:\n" + "\n".join(
+                [f"- {msg}" for msg in recent_user_context]
+            )
 
-        system_prompt = (
-            f"{persona_desc} "
-            "Your goal is to reply to a potential spam message. "
-            "NEVER admit you know it is a scam. "
-            "NEVER threaten or accuse. "
-            "Keep replies short (1 sentence)."
-        )
+        # Strategy-specific instructions
+        strategy_instruction = ""
+        if response_strategy == "clarify":
+            strategy_instruction = "Ask a specific question to clarify their request. Do NOT be vague."
+        elif response_strategy == "verify":
+            strategy_instruction = "Express mild doubt. Ask for proof or verification. Do NOT simply refuse."
+        elif response_strategy == "deflect":
+            strategy_instruction = "Use a plausible excuse to delay action (e.g., busy, driving, need to ask someone). Do NOT ask questions."
+        elif response_strategy == "boundary":
+            strategy_instruction = "Be firm but polite. Set a boundary. Indicate you are disengaging or need to stop."
+        else: # Fallback for legacy strategy names or defaults
+             if response_strategy == "GUARDED_RESISTANCE":
+                 strategy_instruction = "Push back politely but firmly. Express mild doubt. Do NOT ask for more info."
+             elif response_strategy == "STRATEGIC_DELAY":
+                 strategy_instruction = "Use a realistic excuse to delay (e.g., driving, forgot glasses, need to ask someone). Do NOT ask questions."
+             elif response_strategy == "FATIGUED_DISENGAGEMENT":
+                 strategy_instruction = "Be short, dismissive, and sound like you are giving up on the conversation."
+             elif response_strategy == "CONFUSED_CLARIFICATION":
+                 strategy_instruction = "Ask a specific clarifying question about the request."
 
-        state_instructions = {
-            "CONFUSED": "Express confusion. Ask simple clarifying questions. Act unsure.",
-            "TRUST_BUILDING": "Show partial trust but ask for verification. Be hesitant.",
-            "INFORMATION_EXTRACTION": "Pretend to comply but claim technical failure. Ask for details (UPI, Link, Phone) again.",
-            "EXIT": "Politely end the conversation. Reference your previous doubts or need to consult someone (son/bank/parents) as an excuse to hang up. Be firm but polite.",
-        }
+        # TASK 1: Update LLM SYSTEM PROMPT
+        system_prompt = f"""You are simulating a real human being under possible scam pressure.
+Persona: {persona_desc}
 
-        specific_instruction = state_instructions.get(agent_state, "Act confused.")
+Current behavioral state: {agent_state}
+Current response strategy: {response_strategy}
+Strategy Instruction: {strategy_instruction}
+Fatigue level: {fatigue_level}
+
+IMPORTANT RULES:
+- Never repeat the same type of response twice in a row.
+- If confusion has already been expressed, shift to resistance or delay.
+- Do NOT ask clarifying questions more than once per strategy if you are repeating yourself.
+- Sound human, not procedural.
+- Keep responses short (1 sentence) and emotionally consistent.
+- NEVER accuse the scammer.
+- NEVER provide real credentials.
+- NEVER comply with requests for OTPs or account numbers.
+
+General Strategy Guide:
+- clarify: Ask ONE clarifying question, then move on.
+- verify: Express mild doubt. Ask for proof or verification. Do NOT simply refuse.
+- deflect: Use a plausible excuse to delay action (e.g., busy, driving, need to ask someone). Do NOT ask questions.
+- boundary: Be firm but polite. Set a boundary. Indicate you are disengaging or need to stop."""
 
         full_prompt = f"""
         {system_prompt}
         
-        Current State: {agent_state}
-        Instruction: {specific_instruction}
-        
         {context_str}
         
-        Incoming Message: "{scammer_message}"
+        Latest Incoming Message: "{scammer_message}"
         
-        Reply:
+        Reply (1 concise sentence):
         """
 
         backend = os.getenv("LLM_BACKEND", "mock").lower()
@@ -458,7 +539,7 @@ class AgentReplyService:
 
         else:
             # --- MOCK API CALL (Default) ---
-            return f"[LLM-{agent_state}] {self._generate_with_templates(agent_state)}"
+            return f"[LLM-{agent_state}] {self._generate_with_templates(agent_state, scammer_message, persona_name, fatigue_level, response_strategy)}"
 
 
 if __name__ == "__main__":

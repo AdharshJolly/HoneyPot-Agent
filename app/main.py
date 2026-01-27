@@ -23,8 +23,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from fastapi import FastAPI, HTTPException, Header, Depends, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Union
 from datetime import datetime, timezone
 from app.agent.controller import (
     AgentController,
@@ -113,6 +114,25 @@ class AgentMessageResponse(BaseModel):
     timestamp: str
 
 
+class FinalSummaryModel(BaseModel):
+    """Read-only informational summary for closed sessions."""
+
+    scamDetected: bool
+    engagementMetrics: EngagementMetricsModel
+    extractedIntelligence: ExtractedIntelligenceModel
+    agentNotes: str
+
+
+class ClosedSessionResponse(BaseModel):
+    """409 Conflict response for closed sessions."""
+
+    status: str = "session_closed"
+    message: str = "Conversation has already ended."
+    sessionId: str
+    finalCallbackSent: bool
+    finalSummary: FinalSummaryModel
+
+
 # --- Dependencies ---
 
 # Singleton instances
@@ -142,12 +162,27 @@ async def verify_api_key(x_api_key: str = Header(...)):
 app = FastAPI()
 
 
-@app.post("/honeypot/message", response_model=AgentMessageResponse)
+@app.post(
+    "/honeypot/message",
+    response_model=AgentMessageResponse,
+    status_code=200,
+    responses={
+        200: {
+            "model": AgentMessageResponse,
+            "description": "Agent reply for active session",
+        },
+        409: {"model": ClosedSessionResponse, "description": "Session already closed"},
+    },
+)
 async def handle_message(
     request: MessageRequest, api_key: str = Depends(verify_api_key)
 ):
     """
     Process incoming scammer message and generate agent response.
+
+    Returns:
+    - 200: Active session - agent reply generated
+    - 409: Closed session - informational summary returned
     """
 
     # 1. Load or Create Session (Robust Handling for testers)
@@ -155,10 +190,31 @@ async def handle_message(
     session_id = request.sessionId or str(uuid.uuid4())
     session = session_manager.get_or_create_session(session_id)
 
-    # 2. Check Session Lifecycle
+    # 2. Check Session Lifecycle - IMMEDIATE 409 for closed sessions
     if session.sessionClosed:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT, detail="Session already closed"
+        # Build read-only informational summary from stored session data
+        # DO NOT recompute, DO NOT trigger callbacks, DO NOT mutate state
+        closed_response = ClosedSessionResponse(
+            sessionId=session.sessionId,
+            finalCallbackSent=session.callbackSent,
+            finalSummary=FinalSummaryModel(
+                scamDetected=session.scamDetected,
+                engagementMetrics=EngagementMetricsModel(
+                    engagementDurationSeconds=session.engagementMetrics.engagementDurationSeconds,
+                    totalMessagesExchanged=session.totalMessagesExchanged,
+                ),
+                extractedIntelligence=ExtractedIntelligenceModel(
+                    bankAccounts=session.extractedIntelligence.bankAccounts,
+                    upiIds=session.extractedIntelligence.upiIds,
+                    phoneNumbers=session.extractedIntelligence.phoneNumbers,
+                    phishingLinks=session.extractedIntelligence.phishingLinks,
+                    suspiciousKeywords=session.extractedIntelligence.suspiciousKeywords,
+                ),
+                agentNotes=session.agentNotes,
+            ),
+        )
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT, content=closed_response.model_dump()
         )
 
     # 3. Append Scammer Message
@@ -230,6 +286,13 @@ async def handle_message(
 
     if not new_intel_found and has_scam_intent:
         session.redundantScammerMessageCount += 1
+        # Increase fatigue if redundant pressure continues
+        session.repetitionFatigueLevel = min(session.repetitionFatigueLevel + 1, 3)
+    elif new_intel_found:
+        # Reset fatigue slightly if progress is made?
+        # Requirement says "monotonic" for sufficient intel, but fatigue is emotional state.
+        # Let's keep it sticky for realism unless convo shifts.
+        pass
 
     # 6. Determine Agent State Transition
     # Gather signals
@@ -266,7 +329,7 @@ async def handle_message(
         "suspiciousKeywords": session.extractedIntelligence.suspiciousKeywords,
     }
 
-    # Decide Next State
+    # Decide Next State based on signals and readiness scoring
     next_state = agent_controller.decide_next_state(
         current_state=session.agentState,
         signals=signals,
@@ -283,26 +346,33 @@ async def handle_message(
     # WHY: We use the dedicated reply service (LLM or Template) with the session-scoped persona.
     # AgentController logic determines *what* to do (state), ReplyService determines *how* to say it.
 
-    # Extract recent user context (Last 2-3 messages)
-    recent_user_context = []
+    # Extract recent conversation context (Last 5 messages total)
+    recent_convo_context = []
     if request.conversationHistory:
-        # Filter for user messages only
-        user_msgs = [
-            m["text"]
-            for m in request.conversationHistory
-            if m.get("sender") == "user" or m.get("sender") == "scammer"
+        # Include both scammer and agent messages so LLM knows what was said
+        recent_convo_context = [
+            f"{m.get('sender', 'unknown')}: {m.get('text', '')}"
+            for m in request.conversationHistory[-5:]
         ]
-        # Take last 3
-        recent_user_context = user_msgs[-3:]
 
-    # Add current message to context
-    recent_user_context.append(current_text)
+    # Calculate Response Strategy based on fatigue
+    # Logic: 0=clarify, 1=verify, 2=deflect, 3+=boundary
+    if session.repetitionFatigueLevel == 0:
+        response_strategy = "clarify"
+    elif session.repetitionFatigueLevel == 1:
+        response_strategy = "verify"
+    elif session.repetitionFatigueLevel == 2:
+        response_strategy = "deflect"
+    else:
+        response_strategy = "boundary"
 
     agent_reply = agent_reply_service.generate_reply(
         agent_state=session.agentState,
         scammer_message=current_text,
         persona_name=session.agentPersona,
-        recent_user_context=recent_user_context,
+        recent_user_context=recent_convo_context, # Using the existing arg name for combined context
+        fatigue_level=session.repetitionFatigueLevel,
+        response_strategy=response_strategy
     )
 
     # Append Agent Reply to History (if any)
