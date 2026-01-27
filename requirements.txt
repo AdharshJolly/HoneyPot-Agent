@@ -1,0 +1,19 @@
+# --- Core Backend ---
+fastapi==0.110.0
+uvicorn[standard]==0.27.1
+pydantic==2.6.1
+python-dotenv==1.0.1
+
+# --- HTTP / API Calls ---
+requests==2.31.0
+httpx==0.27.0
+
+# --- Streamlit Test Harness ---
+streamlit==1.32.2
+
+# --- Testing ---
+pytest==8.0.2
+
+# --- Optional: Cloud LLM APIs ---
+openai==1.12.0
+google-generativeai==0.3.2
