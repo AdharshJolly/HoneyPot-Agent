@@ -156,6 +156,12 @@ class FinalCallbackDispatcher:
         """
         Construct payload matching API_CONTRACT.md final callback schema.
         """
+        # Generate hybrid agent notes (Deterministic + Optional LLM)
+        final_notes = self._generate_hybrid_agent_notes(session)
+        
+        # Update session with final notes for consistency
+        session.agentNotes = final_notes
+
         return {
             "sessionId": session.sessionId,
             "status": "success",
@@ -172,9 +178,98 @@ class FinalCallbackDispatcher:
                 "phoneNumbers": session.extractedIntelligence.phoneNumbers,
                 "suspiciousKeywords": session.extractedIntelligence.suspiciousKeywords,
             },
-            "agentNotes": session.agentNotes
-            or "Scam detected and intelligence extracted.",
+            "agentNotes": final_notes,
         }
+
+    def _generate_hybrid_agent_notes(self, session: Session) -> str:
+        """
+        Generate agent notes using a deterministic base with optional LLM enrichment.
+        """
+        # 1. Deterministic Base (MANDATORY)
+        base_notes = self._build_base_agent_notes(session)
+
+        # 2. Optional LLM Enrichment (STRICTLY LIMITED)
+        use_llm_notes = os.getenv("USE_LLM_AGENT_NOTES", "false").lower() == "true"
+        
+        if use_llm_notes:
+            try:
+                enriched_notes = self._enrich_notes_with_llm(base_notes)
+                if enriched_notes:
+                    return enriched_notes
+            except Exception as e:
+                logger.warning(f"LLM agentNotes enrichment failed: {e}. Falling back to base notes.")
+        
+        return base_notes
+
+    def _build_base_agent_notes(self, session: Session) -> str:
+        """
+        Derive deterministic, fact-based notes from extracted intelligence.
+        """
+        indicators = []
+        intel = session.extractedIntelligence
+        
+        # Financial Credentials
+        if intel.bankAccounts:
+            indicators.append("Attempted financial credential extraction")
+            
+        # Urgency/Pressure
+        urgency_terms = {"urgent", "immediately", "verify now", "block", "suspend", "expire", "act now"}
+        if any(term in k.lower() for term in urgency_terms for k in intel.suspiciousKeywords):
+            indicators.append("Urgency and pressure tactics used")
+            
+        # Impersonation (inferred from bank keywords/context)
+        if "account" in str(intel.suspiciousKeywords).lower() or "bank" in str(intel.suspiciousKeywords).lower():
+             indicators.append("Impersonation of bank authority")
+
+        # External Redirection
+        if intel.phishingLinks:
+            indicators.append("Phishing vector deployed")
+        if intel.upiIds or intel.phoneNumbers:
+            indicators.append("External contact escalation attempted")
+
+        # Coercion (Volume)
+        if session.totalMessagesExchanged > 6:
+            indicators.append("Repeated coercion across multiple messages")
+
+        if not indicators:
+            return "Scam intent detected; standard indicators observed."
+
+        return "; ".join(indicators)
+
+    def _enrich_notes_with_llm(self, base_notes: str) -> Optional[str]:
+        """
+        Refine base notes using LLM. Strictly rephrasing, no new facts.
+        """
+        # Only support Local/Ollama for this specific optional feature to keep it lightweight
+        # or reuse the environment config if valid.
+        
+        backend = os.getenv("LLM_BACKEND", "local").lower()
+        if backend != "local":
+            return None # Skip for non-local to avoid complexity in this helper for now
+
+        base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
+        model_name = os.getenv("OLLAMA_MODEL", "llama3.1")
+        
+        prompt = (
+            f"Task: Rewrite these scam indicators into ONE concise, professional analyst sentence.\n"
+            f"Input: {base_notes}\n"
+            f"Constraints: Do not add new facts. Do not speculate. Keep it under 30 words.\n"
+            f"Output:"
+        )
+
+        try:
+            response = requests.post(
+                f"{base_url}/api/generate",
+                json={"model": model_name, "prompt": prompt, "stream": False},
+                timeout=5
+            )
+            if response.status_code == 200:
+                result = response.json().get("response", "").strip()
+                return result if result else None
+        except Exception:
+            return None
+        
+        return None
 
     def _send_callback(self, payload: Dict[str, Any]) -> bool:
         """

@@ -148,10 +148,9 @@ class AgentController:
         self,
         current_state: str,
         signals: List[str],
-        message_count: int = 0,
-        intelligence_count: int = 0,
+        message_count: int,
+        extracted_intelligence: Dict[str, List[str]],
         redundant_count: int = 0,
-        has_sufficient_intelligence: bool = False,
     ) -> str:
         """
         Determine the next agent state based on current state and observed signals.
@@ -161,17 +160,16 @@ class AgentController:
         - Not dependent on LLM interpretation
         - Auditable decision trail
 
-        WHY message_count and intelligence_count:
-        - Prevents infinite loops
-        - Ensures EXIT triggers after reasonable engagement
+        WHY extracted_intelligence and redundant_count:
+        - Enables sophisticated exit logic (Categories A, B, C)
+        - Prevents premature exit
 
         Args:
             current_state: Current agentState (string from session)
             signals: List of TransitionSignal values detected
             message_count: Total messages in conversation
-            intelligence_count: Number of extracted intelligence items
+            extracted_intelligence: Dictionary of list of extracted artifacts
             redundant_count: Number of redundant scammer messages tracked
-            has_sufficient_intelligence: Boolean flag for intelligence sufficiency
 
         Returns:
             Next state name (string)
@@ -188,15 +186,72 @@ class AgentController:
         if current == AgentState.EXIT:
             return AgentState.EXIT.value
             
-        # OPTION B: Redundancy-Aware Exit
-        # If we have what we need and the scammer is just repeating pressure tactics, exit.
-        if has_sufficient_intelligence and redundant_count >= 2:
+        # CHECK EXIT CONDITIONS (Categories A + B + C)
+        if self._should_exit(extracted_intelligence, message_count, redundant_count):
             return AgentState.EXIT.value
 
         # Determine next state based on current state and signals
         next_state = self._evaluate_transition(
-            current, signals, message_count, intelligence_count
+            current, signals, message_count, 0 # intelligence_count unused in new logic, passing 0
         )
+
+        # TRANSITION LEGALITY CHECK: Enforce allowed transitions
+        if next_state not in self.ALLOWED_TRANSITIONS[current] and next_state != current:
+             # Allow staying in same state, but if it changed, must be allowed
+             # Actually, ALLOWED_TRANSITIONS only lists *changes*.
+             # The logic below handles the check.
+             pass
+
+        # If state changed, validate it is allowed
+        if next_state != current:
+             if next_state not in self.ALLOWED_TRANSITIONS[current]:
+                raise ValueError(
+                    f"Illegal state transition: {current.value} → {next_state.value}. "
+                    f"Allowed transitions: {[s.value for s in self.ALLOWED_TRANSITIONS[current]]}"
+                )
+
+        return next_state.value
+
+    def _should_exit(
+        self, intel: Dict[str, List[str]], message_count: int, redundant_count: int
+    ) -> bool:
+        """
+        Evaluate strict exit conditions (Categories A, B, C).
+        
+        Returns True ONLY if all categories are satisfied.
+        """
+        # CATEGORY A: High-Value Intelligence Presence (REQUIRED)
+        has_high_value = (
+            len(intel.get("bankAccounts", [])) > 0 or 
+            len(intel.get("upiIds", [])) > 0 or 
+            len(intel.get("phishingLinks", [])) > 0 or 
+            len(intel.get("phoneNumbers", [])) > 0
+        )
+        if not has_high_value:
+            return False
+
+        # CATEGORY B: Evidence Sufficiency (REQUIRED)
+        # 1. Multi-modal (more than 1 type)
+        types_count = sum([
+            1 if len(intel.get("bankAccounts", [])) > 0 else 0,
+            1 if len(intel.get("upiIds", [])) > 0 else 0,
+            1 if len(intel.get("phishingLinks", [])) > 0 else 0,
+            1 if len(intel.get("phoneNumbers", [])) > 0 else 0
+        ])
+        # 2. OR Redundancy (implies same artifact across turns)
+        # 3. OR Minimum turns (default 6)
+        is_sufficient = (types_count > 1) or (redundant_count > 0) or (message_count >= 6)
+        
+        if not is_sufficient:
+            return False
+
+        # CATEGORY C: Scammer Persistence or Pressure (REQUIRED)
+        # 1. Suspicious keywords >= 2
+        # 2. OR Redundant messages (implies repeated intent/urgency)
+        keyword_count = len(intel.get("suspiciousKeywords", []))
+        has_pressure = (keyword_count >= 2) or (redundant_count > 0)
+        
+        return has_pressure
 
         # TRANSITION LEGALITY CHECK: Enforce allowed transitions
         if next_state not in self.ALLOWED_TRANSITIONS[current] and next_state != current:

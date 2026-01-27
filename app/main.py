@@ -185,7 +185,7 @@ async def handle_message(
     # Update Session Intelligence (Deduplicated)
     # We access the dataclass directly as SessionManager allows object mutation via get methods implicitly
     # or we can assume we need to manage this. Since Session is returned by get_or_create_session, it's mutable.
-    
+
     new_intel_found = False
 
     def merge_lists(target_list: List[str], new_items: List[str]):
@@ -211,21 +211,23 @@ async def handle_message(
         session.extractedIntelligence.suspiciousKeywords,
         extracted_data["suspiciousKeywords"],
     )
-    
+
     # Update Sufficient Intelligence Flag
     has_intel = (
-        len(session.extractedIntelligence.bankAccounts) > 0 or
-        len(session.extractedIntelligence.upiIds) > 0 or
-        len(session.extractedIntelligence.phoneNumbers) > 0 or
-        len(session.extractedIntelligence.phishingLinks) > 0
+        len(session.extractedIntelligence.bankAccounts) > 0
+        or len(session.extractedIntelligence.upiIds) > 0
+        or len(session.extractedIntelligence.phoneNumbers) > 0
+        or len(session.extractedIntelligence.phishingLinks) > 0
     )
     if session.scamDetected and has_intel:
         session.hasSufficientIntelligence = True
 
     # Check for Redundant Scammer Messages
     # Definition: No new intel AND intent matches (urgency/payment)
-    has_scam_intent = detect_urgency(current_text) or detect_payment_request(current_text)
-    
+    has_scam_intent = detect_urgency(current_text) or detect_payment_request(
+        current_text
+    )
+
     if not new_intel_found and has_scam_intent:
         session.redundantScammerMessageCount += 1
 
@@ -255,14 +257,22 @@ async def handle_message(
     if total_intel >= 3:
         signals.append(TransitionSignal.INTELLIGENCE_THRESHOLD_MET.value)
 
+    # Prepare intel dict for controller logic
+    intel_dict = {
+        "bankAccounts": session.extractedIntelligence.bankAccounts,
+        "upiIds": session.extractedIntelligence.upiIds,
+        "phishingLinks": session.extractedIntelligence.phishingLinks,
+        "phoneNumbers": session.extractedIntelligence.phoneNumbers,
+        "suspiciousKeywords": session.extractedIntelligence.suspiciousKeywords,
+    }
+
     # Decide Next State
     next_state = agent_controller.decide_next_state(
         current_state=session.agentState,
         signals=signals,
         message_count=session.totalMessagesExchanged,
-        intelligence_count=total_intel,
+        extracted_intelligence=intel_dict,
         redundant_count=session.redundantScammerMessageCount,
-        has_sufficient_intelligence=session.hasSufficientIntelligence,
     )
 
     # Update State if changed
@@ -272,10 +282,27 @@ async def handle_message(
     # 7. Generate Agent Reply
     # WHY: We use the dedicated reply service (LLM or Template) with the session-scoped persona.
     # AgentController logic determines *what* to do (state), ReplyService determines *how* to say it.
+
+    # Extract recent user context (Last 2-3 messages)
+    recent_user_context = []
+    if request.conversationHistory:
+        # Filter for user messages only
+        user_msgs = [
+            m["text"]
+            for m in request.conversationHistory
+            if m.get("sender") == "user" or m.get("sender") == "scammer"
+        ]
+        # Take last 3
+        recent_user_context = user_msgs[-3:]
+
+    # Add current message to context
+    recent_user_context.append(current_text)
+
     agent_reply = agent_reply_service.generate_reply(
         agent_state=session.agentState,
         scammer_message=current_text,
         persona_name=session.agentPersona,
+        recent_user_context=recent_user_context,
     )
 
     # Append Agent Reply to History (if any)

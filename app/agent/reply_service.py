@@ -199,6 +199,7 @@ class AgentReplyService:
         agent_state: str,
         scammer_message: str,
         persona_name: str = "confused_elderly",
+        recent_user_context: Optional[List[str]] = None,
     ) -> str:
         """
         Generate a reply based on state, input, and persona.
@@ -207,6 +208,7 @@ class AgentReplyService:
             agent_state: The *already decided* behavioral state.
             scammer_message: The trigger message to reply to.
             persona_name: The immutable session persona.
+            recent_user_context: List of recent messages from the scammer for context.
 
         Returns:
             A single string reply.
@@ -220,7 +222,7 @@ class AgentReplyService:
         if self.use_llm:
             try:
                 return self._generate_with_llm(
-                    agent_state, scammer_message, persona_name
+                    agent_state, scammer_message, persona_name, recent_user_context
                 )
             except Exception as e:
                 # STRICT MODE: Crash if generation fails
@@ -258,6 +260,16 @@ class AgentReplyService:
         Returns:
             Persona-appropriate, context-sensitive template reply
         """
+        # Improved EXIT templates for deterministic "memory" feel
+        if agent_state == "EXIT":
+            exit_templates = {
+                "confused_elderly": "As I said, I need to ask my son about this. I'm hanging up now.",
+                "busy_professional": "Like I mentioned, I'll verify this through official channels. Goodbye.",
+                "naive_student": "I'm going to call my parents like I said. Bye.",
+                "skeptical_user": "I told you I don't trust this. I'm verifying independently. Bye."
+            }
+            return exit_templates.get(persona_name, "I need to go now. Goodbye.")
+
         # Get templates for this state and persona
         state_templates = self._fallback_templates.get(agent_state)
         if not state_templates:
@@ -352,7 +364,7 @@ class AgentReplyService:
         return templates
 
     def _generate_with_llm(
-        self, agent_state: str, scammer_message: str, persona_name: str
+        self, agent_state: str, scammer_message: str, persona_name: str, recent_user_context: Optional[List[str]] = None
     ) -> str:
         """
         Generate reply using LLM (Real local or Mock API).
@@ -364,6 +376,10 @@ class AgentReplyService:
         persona_desc = self.PERSONA_DEFINITIONS.get(
             persona_name, self.PERSONA_DEFINITIONS["confused_elderly"]
         )
+
+        context_str = ""
+        if recent_user_context:
+            context_str = "Recent User Messages:\n" + "\n".join([f"- {msg}" for msg in recent_user_context])
 
         system_prompt = (
             f"{persona_desc} "
@@ -377,7 +393,7 @@ class AgentReplyService:
             "CONFUSED": "Express confusion. Ask simple clarifying questions. Act unsure.",
             "TRUST_BUILDING": "Show partial trust but ask for verification. Be hesitant.",
             "INFORMATION_EXTRACTION": "Pretend to comply but claim technical failure. Ask for details (UPI, Link, Phone) again.",
-            "EXIT": "Politely end the conversation. Make a believable excuse to leave.",
+            "EXIT": "Politely end the conversation. Reference your previous doubts or need to consult someone (son/bank/parents) as an excuse to hang up. Be firm but polite.",
         }
 
         specific_instruction = state_instructions.get(agent_state, "Act confused.")
@@ -387,6 +403,8 @@ class AgentReplyService:
         
         Current State: {agent_state}
         Instruction: {specific_instruction}
+        
+        {context_str}
         
         Incoming Message: "{scammer_message}"
         
