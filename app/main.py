@@ -95,42 +95,13 @@ class MessageRequest(BaseModel):
     metadata: Optional[MetadataModel] = None
 
 
-class EngagementMetricsModel(BaseModel):
-    engagementDurationSeconds: int
-    totalMessagesExchanged: int
 
 
-class ExtractedIntelligenceModel(BaseModel):
-    bankAccounts: List[str]
-    upiIds: List[str]
-    phoneNumbers: List[str]
-    phishingLinks: List[str]
-    suspiciousKeywords: List[str]
 
 
-class AgentMessageResponse(BaseModel):
-    sender: str = "agent"
-    text: str
-    timestamp: str
 
 
-class FinalSummaryModel(BaseModel):
-    """Read-only informational summary for closed sessions."""
 
-    scamDetected: bool
-    engagementMetrics: EngagementMetricsModel
-    extractedIntelligence: ExtractedIntelligenceModel
-    agentNotes: str
-
-
-class ClosedSessionResponse(BaseModel):
-    """409 Conflict response for closed sessions."""
-
-    status: str = "session_closed"
-    message: str = "Conversation has already ended."
-    sessionId: str
-    finalCallbackSent: bool
-    finalSummary: FinalSummaryModel
 
 
 # --- Dependencies ---
@@ -162,18 +133,7 @@ async def verify_api_key(x_api_key: str = Header(...)):
 app = FastAPI()
 
 
-@app.post(
-    "/honeypot/message",
-    response_model=AgentMessageResponse,
-    status_code=200,
-    responses={
-        200: {
-            "model": AgentMessageResponse,
-            "description": "Agent reply for active session",
-        },
-        409: {"model": ClosedSessionResponse, "description": "Session already closed"},
-    },
-)
+@app.post("/honeypot/message", status_code=200)
 async def handle_message(
     request: MessageRequest, api_key: str = Depends(verify_api_key)
 ):
@@ -192,29 +152,9 @@ async def handle_message(
 
     # 2. Check Session Lifecycle - IMMEDIATE 409 for closed sessions
     if session.sessionClosed:
-        # Build read-only informational summary from stored session data
-        # DO NOT recompute, DO NOT trigger callbacks, DO NOT mutate state
-        closed_response = ClosedSessionResponse(
-            sessionId=session.sessionId,
-            finalCallbackSent=session.callbackSent,
-            finalSummary=FinalSummaryModel(
-                scamDetected=session.scamDetected,
-                engagementMetrics=EngagementMetricsModel(
-                    engagementDurationSeconds=session.engagementMetrics.engagementDurationSeconds,
-                    totalMessagesExchanged=session.totalMessagesExchanged,
-                ),
-                extractedIntelligence=ExtractedIntelligenceModel(
-                    bankAccounts=session.extractedIntelligence.bankAccounts,
-                    upiIds=session.extractedIntelligence.upiIds,
-                    phoneNumbers=session.extractedIntelligence.phoneNumbers,
-                    phishingLinks=session.extractedIntelligence.phishingLinks,
-                    suspiciousKeywords=session.extractedIntelligence.suspiciousKeywords,
-                ),
-                agentNotes=session.agentNotes,
-            ),
-        )
         return JSONResponse(
-            status_code=status.HTTP_409_CONFLICT, content=closed_response.model_dump()
+            status_code=200,
+            content={"output": "Session already closed."}
         )
 
     # 3. Append Scammer Message
@@ -397,11 +337,7 @@ async def handle_message(
         session.engagementMetrics.engagementDurationSeconds = duration
 
     # 9. Construct Conversational Response
-    return AgentMessageResponse(
-        sender="agent",
-        text=agent_reply or "...",
-        timestamp=datetime.now(timezone.utc).isoformat(),
-    )
+    return JSONResponse(content={"output": agent_reply or "..."})
 
 
 if __name__ == "__main__":
