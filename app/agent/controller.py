@@ -20,6 +20,9 @@ DOES NOT:
 from typing import Tuple, Optional, Dict, Set, List
 from enum import Enum
 import random
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class AgentState(Enum):
@@ -247,45 +250,39 @@ class AgentController:
         """
         # CATEGORY A: High-Value Intelligence Presence (REQUIRED)
         has_high_value = (
-            len(intel.get("bankAccounts", [])) > 0
-            or len(intel.get("upiIds", [])) > 0
-            or len(intel.get("phishingLinks", [])) > 0
-            or len(intel.get("phoneNumbers", [])) > 0
+            len(intel.get("bankAccounts", [])) > 0 or 
+            len(intel.get("upiIds", [])) > 0 or 
+            len(intel.get("phishingLinks", [])) > 0 or 
+            len(intel.get("phoneNumbers", [])) > 0
         )
-        # EXIT requires at least one extracted artifact
-        if not has_high_value:
-            return False
-
-        # EXIT requires meaningful engagement (avoid early exits)
-        if message_count < 4:
-            return False
-
+        
         # CATEGORY B: Evidence Sufficiency (REQUIRED)
         # 1. Multi-modal (more than 1 type)
-        types_count = sum(
-            [
-                1 if len(intel.get("bankAccounts", [])) > 0 else 0,
-                1 if len(intel.get("upiIds", [])) > 0 else 0,
-                1 if len(intel.get("phishingLinks", [])) > 0 else 0,
-                1 if len(intel.get("phoneNumbers", [])) > 0 else 0,
-            ]
-        )
+        types_count = sum([
+            1 if len(intel.get("bankAccounts", [])) > 0 else 0,
+            1 if len(intel.get("upiIds", [])) > 0 else 0,
+            1 if len(intel.get("phishingLinks", [])) > 0 else 0,
+            1 if len(intel.get("phoneNumbers", [])) > 0 else 0
+        ])
         # 2. OR Redundancy (implies same artifact across turns)
         # 3. OR Minimum turns (default 6)
-        is_sufficient = (
-            (types_count > 1) or (redundant_count > 0) or (message_count >= 6)
-        )
-
-        if not is_sufficient:
-            return False
-
+        is_sufficient = (types_count > 1) or (redundant_count > 0) or (message_count >= 6)
+        
         # CATEGORY C: Scammer Persistence or Pressure (REQUIRED)
         # 1. Suspicious keywords >= 2
         # 2. OR Redundant messages (implies repeated intent/urgency)
         keyword_count = len(intel.get("suspiciousKeywords", []))
         has_pressure = (keyword_count >= 2) or (redundant_count > 0)
-
-        return has_pressure
+        
+        should_exit = has_high_value and is_sufficient and has_pressure
+        
+        if not should_exit:
+            logger.debug(
+                f"Exit blocked: HighValue={has_high_value}, Sufficient={is_sufficient}, Pressure={has_pressure} "
+                f"(Types={types_count}, Redundant={redundant_count}, Msgs={message_count})"
+            )
+            
+        return should_exit
 
     def _evaluate_transition(
         self,

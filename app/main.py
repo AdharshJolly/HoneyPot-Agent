@@ -17,10 +17,22 @@ CRITICAL:
 
 import os
 import uuid
+import logging
 from dotenv import load_dotenv
 
 # Load environment variables explicitly before other imports
 load_dotenv()
+
+# Configure logging for development visibility
+env = os.getenv("ENVIRONMENT", "production").lower()
+log_level = logging.DEBUG if env == "development" else logging.INFO
+
+logging.basicConfig(
+    level=log_level,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
 
 from fastapi import FastAPI, HTTPException, Header, Depends, status
 from fastapi.responses import JSONResponse
@@ -336,6 +348,15 @@ async def handle_message(
         message_count=session.totalMessagesExchanged,
         extracted_intelligence=intel_dict,
         redundant_count=session.redundantScammerMessageCount,
+    )
+    
+    # DEBUG LOGGING: Trace decision flow
+    logger.info(
+        f"Session {session.sessionId} | "
+        f"State: {session.agentState} -> {next_state} | "
+        f"Intel: {len(intel_dict['bankAccounts'])} Bank, {len(intel_dict['upiIds'])} UPI, {len(intel_dict['phishingLinks'])} Links | "
+        f"Redundant: {session.redundantScammerMessageCount} | "
+        f"Msgs: {session.totalMessagesExchanged}"
     )
 
     # Update State if changed

@@ -77,24 +77,8 @@ class FinalCallbackDispatcher:
     def check_and_dispatch(self, session_id: str) -> bool:
         """
         Check if callback conditions are met and dispatch if so.
-
-        CRITICAL LOGIC:
-        1. Load session
-        2. Verify strict conditions:
-           - scamDetected is True
-           - agentState is EXIT
-           - callbackSent is False
-        3. Build payload
-        4. Send callback
-        5. Mark session closed (Terminal State)
-
-        Args:
-            session_id: Target session ID
-
-        Returns:
-            True if callback was sent successfully or was already sent.
-            False if conditions were not met or dispatch failed.
         """
+        logger.info(f"Checking callback conditions for session {session_id}...")
         session = self.session_manager.get_session(session_id)
 
         if not session:
@@ -108,6 +92,7 @@ class FinalCallbackDispatcher:
 
         # TRIGGER CONDITIONS check
         if not self._should_trigger_callback(session):
+            logger.info(f"Callback conditions NOT met for {session_id}. State={session.agentState}, ScamDetected={session.scamDetected}")
             return False
 
         # Prepare Payload
@@ -290,6 +275,7 @@ class FinalCallbackDispatcher:
 
             if response.status_code in [200, 201, 202]:
                 logger.info(f"Callback success: {response.status_code}")
+                logger.info(f"Callback response body: {response.text}")
                 return True
             else:
                 logger.error(
