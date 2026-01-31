@@ -267,7 +267,7 @@ class FinalCallbackDispatcher:
             if self.api_key:
                 headers["x-api-key"] = self.api_key
 
-            print(payload)
+            logger.debug(f"Sending callback payload: {payload}")
 
             response = self._http_client.post(
                 self.callback_url, json=payload, headers=headers, timeout=10
