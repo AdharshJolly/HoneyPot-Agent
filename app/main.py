@@ -30,11 +30,11 @@ log_level = logging.DEBUG if env == "development" else logging.INFO
 logging.basicConfig(
     level=log_level,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[logging.StreamHandler()]
+    handlers=[logging.StreamHandler()],
 )
 logger = logging.getLogger(__name__)
 
-from fastapi import FastAPI, HTTPException, Header, Depends, status
+from fastapi import FastAPI, HTTPException, Header, Depends, status, BackgroundTasks
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any, Union
@@ -121,28 +121,8 @@ class ExtractedIntelligenceModel(BaseModel):
 
 
 class AgentMessageResponse(BaseModel):
-    sender: str = "agent"
-    text: str
-    timestamp: str
-
-
-class FinalSummaryModel(BaseModel):
-    """Read-only informational summary for closed sessions."""
-
-    scamDetected: bool
-    engagementMetrics: EngagementMetricsModel
-    extractedIntelligence: ExtractedIntelligenceModel
-    agentNotes: str
-
-
-class ClosedSessionResponse(BaseModel):
-    """409 Conflict response for closed sessions."""
-
-    status: str = "session_closed"
-    message: str = "Conversation has already ended."
-    sessionId: str
-    finalCallbackSent: bool
-    finalSummary: FinalSummaryModel
+    status: str = "success"
+    reply: str
 
 
 # --- Dependencies ---
@@ -181,20 +161,20 @@ app = FastAPI()
     responses={
         200: {
             "model": AgentMessageResponse,
-            "description": "Agent reply for active session",
-        },
-        409: {"model": ClosedSessionResponse, "description": "Session already closed"},
+            "description": "Agent reply for active or closed session",
+        }
     },
 )
 async def handle_message(
-    request: MessageRequest, api_key: str = Depends(verify_api_key)
+    request: MessageRequest,
+    background_tasks: BackgroundTasks,
+    api_key: str = Depends(verify_api_key),
 ):
     """
     Process incoming scammer message and generate agent response.
 
     Returns:
-    - 200: Active session - agent reply generated
-    - 409: Closed session - informational summary returned
+    - 200: Agent reply generated for active or closed session.
     """
 
     # 1. Load or Create Session (Robust Handling for testers)
@@ -202,32 +182,28 @@ async def handle_message(
     session_id = request.sessionId or str(uuid.uuid4())
     session = session_manager.get_or_create_session(session_id)
 
-    # 2. Check Session Lifecycle - IMMEDIATE 409 for closed sessions
+    # 2. Check Session Lifecycle - Return 200 OK for closed sessions as per hackathon spec
     if session.sessionClosed:
-        # Build read-only informational summary from stored session data
-        # DO NOT recompute, DO NOT trigger callbacks, DO NOT mutate state
-        closed_response = ClosedSessionResponse(
-            sessionId=session.sessionId,
-            finalCallbackSent=session.callbackSent,
-            finalSummary=FinalSummaryModel(
-                scamDetected=session.scamDetected,
-                engagementMetrics=EngagementMetricsModel(
-                    engagementDurationSeconds=session.engagementMetrics.engagementDurationSeconds,
-                    totalMessagesExchanged=session.totalMessagesExchanged,
-                ),
-                extractedIntelligence=ExtractedIntelligenceModel(
-                    bankAccounts=session.extractedIntelligence.bankAccounts,
-                    upiIds=session.extractedIntelligence.upiIds,
-                    phoneNumbers=session.extractedIntelligence.phoneNumbers,
-                    phishingLinks=session.extractedIntelligence.phishingLinks,
-                    suspiciousKeywords=session.extractedIntelligence.suspiciousKeywords,
-                ),
-                agentNotes=session.agentNotes,
+        # For closed sessions, return a 200 OK with a consistent reply message.
+        # Try to get the last agent reply from conversation history.
+        # If no agent messages, provide a default message.
+        last_agent_message = next(
+            (
+                msg.text
+                for msg in reversed(session.conversationHistory)
+                if msg.sender == "agent"
             ),
+            None,
         )
-        return JSONResponse(
-            status_code=status.HTTP_409_CONFLICT, content=closed_response.model_dump()
+        final_reply_for_closed_session = (
+            last_agent_message
+            if last_agent_message
+            else "The conversation has ended. Thank you for your messages."
         )
+        logger.info(
+            f"Session {session.sessionId} is closed. Returning consistent 200 OK response."
+        )
+        return AgentMessageResponse(reply=final_reply_for_closed_session)
 
     # 3. Append Scammer Message
     session_manager.append_message(
@@ -342,14 +318,17 @@ async def handle_message(
     }
 
     # Decide Next State based on signals and readiness scoring
+    # CORRECTED: Passing full session state for richer context
     next_state = agent_controller.decide_next_state(
         current_state=session.agentState,
         signals=signals,
         message_count=session.totalMessagesExchanged,
         extracted_intelligence=intel_dict,
         redundant_count=session.redundantScammerMessageCount,
+        current_state_turns=session.stateTurnCount.get(session.agentState, 0),
+        stall_count=session.stallCount,
     )
-    
+
     # DEBUG LOGGING: Trace decision flow
     logger.info(
         f"Session {session.sessionId} | "
@@ -362,6 +341,14 @@ async def handle_message(
     # Update State if changed
     if next_state != session.agentState:
         session_manager.update_agent_state(session.sessionId, next_state)
+        session.agentState = next_state  # Update local object to reflect state change
+        # Reset state turn count on transition
+        session.stateTurnCount[session.agentState] = 0
+    else:
+        # Increment state turn count if no transition
+        session.stateTurnCount[session.agentState] = (
+            session.stateTurnCount.get(session.agentState, 0) + 1
+        )
 
     # 7. Generate Agent Reply
     # WHY: We use the dedicated reply service (LLM or Template) with the session-scoped persona.
@@ -391,9 +378,9 @@ async def handle_message(
         agent_state=session.agentState,
         scammer_message=current_text,
         persona_name=session.agentPersona,
-        recent_user_context=recent_convo_context, # Using the existing arg name for combined context
+        recent_user_context=recent_convo_context,  # Using the existing arg name for combined context
         fatigue_level=session.repetitionFatigueLevel,
-        response_strategy=response_strategy
+        response_strategy=response_strategy,
     )
 
     # Append Agent Reply to History (if any)
@@ -404,7 +391,9 @@ async def handle_message(
     # WHY: Trigger callback AFTER appending the final agent reply.
     # The dispatcher will mark the session as closed, so no further mutations allowed.
     if session.agentState == "EXIT":
-        callback_dispatcher.check_and_dispatch(session.sessionId)
+        background_tasks.add_task(
+            callback_dispatcher.check_and_dispatch, session.sessionId
+        )
 
     # 8. Calculate Metrics
     # Duration: Current Time - Engagement Start Time (if set)
@@ -418,11 +407,7 @@ async def handle_message(
         session.engagementMetrics.engagementDurationSeconds = duration
 
     # 9. Construct Conversational Response
-    return AgentMessageResponse(
-        sender="agent",
-        text=agent_reply or "...",
-        timestamp=datetime.now(timezone.utc).isoformat(),
-    )
+    return AgentMessageResponse(reply=agent_reply or "...")
 
 
 if __name__ == "__main__":

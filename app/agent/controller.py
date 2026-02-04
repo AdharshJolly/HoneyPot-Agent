@@ -212,18 +212,15 @@ class AgentController:
         if current != AgentState.INIT and current_state_turns < min_dwell:
             return current.value
 
-        # --- EXIT LOGIC (TASK 4) ---
-        # Exit only if:
-        # 1. Categories A+B+C satisfied (via _should_exit)
-        # 2. At least one stall response used (stall_count > 0)
-        if self._should_exit(extracted_intelligence, message_count, redundant_count):
-            if stall_count >= 1:
+        # --- EXIT LOGIC ---
+        # Exit AUTOMATICALLY once intelligence extraction goals are met (Categories A+B+C satisfied).
+        # NO hard exit setup - the state machine drives it via _should_exit conditions.
+        # This allows the agent to naturally conclude once sufficient artifacts are collected.
+        if current == AgentState.INFORMATION_EXTRACTION:
+            if self._should_exit(
+                extracted_intelligence, message_count, redundant_count
+            ):
                 return AgentState.EXIT.value
-            # If ready to exit but haven't stalled, maybe next turn?
-            # Or forces transition logic below to handle it.
-            # Actually, if we are in EXTRACTION and ready to exit but haven't stalled,
-            # we should stay in EXTRACTION (which might trigger a stall reply via reply_service).
-            pass
 
         # Determine next state based on current state and signals
         intelligence_count = sum(len(v) for v in extracted_intelligence.values())
@@ -250,38 +247,42 @@ class AgentController:
         """
         # CATEGORY A: High-Value Intelligence Presence (REQUIRED)
         has_high_value = (
-            len(intel.get("bankAccounts", [])) > 0 or 
-            len(intel.get("upiIds", [])) > 0 or 
-            len(intel.get("phishingLinks", [])) > 0 or 
-            len(intel.get("phoneNumbers", [])) > 0
+            len(intel.get("bankAccounts", [])) > 0
+            or len(intel.get("upiIds", [])) > 0
+            or len(intel.get("phishingLinks", [])) > 0
+            or len(intel.get("phoneNumbers", [])) > 0
         )
-        
+
         # CATEGORY B: Evidence Sufficiency (REQUIRED)
         # 1. Multi-modal (more than 1 type)
-        types_count = sum([
-            1 if len(intel.get("bankAccounts", [])) > 0 else 0,
-            1 if len(intel.get("upiIds", [])) > 0 else 0,
-            1 if len(intel.get("phishingLinks", [])) > 0 else 0,
-            1 if len(intel.get("phoneNumbers", [])) > 0 else 0
-        ])
+        types_count = sum(
+            [
+                1 if len(intel.get("bankAccounts", [])) > 0 else 0,
+                1 if len(intel.get("upiIds", [])) > 0 else 0,
+                1 if len(intel.get("phishingLinks", [])) > 0 else 0,
+                1 if len(intel.get("phoneNumbers", [])) > 0 else 0,
+            ]
+        )
         # 2. OR Redundancy (implies same artifact across turns)
         # 3. OR Minimum turns (default 6)
-        is_sufficient = (types_count > 1) or (redundant_count > 0) or (message_count >= 6)
-        
+        is_sufficient = (
+            (types_count > 1) or (redundant_count > 0) or (message_count >= 6)
+        )
+
         # CATEGORY C: Scammer Persistence or Pressure (REQUIRED)
         # 1. Suspicious keywords >= 2
         # 2. OR Redundant messages (implies repeated intent/urgency)
         keyword_count = len(intel.get("suspiciousKeywords", []))
         has_pressure = (keyword_count >= 2) or (redundant_count > 0)
-        
+
         should_exit = has_high_value and is_sufficient and has_pressure
-        
+
         if not should_exit:
             logger.debug(
                 f"Exit blocked: HighValue={has_high_value}, Sufficient={is_sufficient}, Pressure={has_pressure} "
                 f"(Types={types_count}, Redundant={redundant_count}, Msgs={message_count})"
             )
-            
+
         return should_exit
 
     def _evaluate_transition(
