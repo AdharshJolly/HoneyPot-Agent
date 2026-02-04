@@ -51,7 +51,9 @@ class AgentReplyService:
         if self.llm_backend == "gemini":
             self.llm_api_key = os.getenv("GEMINI_API_KEY")
             if not self.llm_api_key:
-                raise ValueError("LLM_BACKEND is 'gemini' but GEMINI_API_KEY is not set.")
+                raise ValueError(
+                    "LLM_BACKEND is 'gemini' but GEMINI_API_KEY is not set."
+                )
             genai.configure(api_key=self.llm_api_key)
         else:
             self.llm_api_key = os.getenv("LLM_API_KEY")
@@ -65,7 +67,9 @@ class AgentReplyService:
                 )
             logger.info("STRICT_LLM_MODE active. Template fallback disabled.")
         elif self.use_llm:
-            logger.info(f"LLM generation enabled (backend: {self.llm_backend}, with template fallback).")
+            logger.info(
+                f"LLM generation enabled (backend: {self.llm_backend}, with template fallback)."
+            )
 
         # Persona Definitions (Data-driven tone control)
         # Used to influence LLM generation without changing state logic
@@ -75,7 +79,7 @@ class AgentReplyService:
             "naive_student": "You are a university student. You are fearful of losing money. You are eager to comply but easily confused.",
             "skeptical_user": "You are a cautious user. You suspect something might be wrong but you are curious. You ask for proof.",
         }
-        
+
         # Fatigued/Disengaged templates (Fatigue Level >= 2)
         # Used across personas when pressure becomes repetitive
         self._fatigued_templates = [
@@ -86,7 +90,7 @@ class AgentReplyService:
             "I can't do this right now.",
             "I'm getting confused, just wait.",
         ]
-        
+
         # Strategy-Specific Templates (Tone Control)
         self._strategy_templates = {
             "GUARDED_RESISTANCE": [
@@ -102,8 +106,8 @@ class AgentReplyService:
                 "I'm outside right now, can't check.",
                 "I'm driving, message later.",
                 "Let me find my glasses first.",
-                "The internet is very slow here."
-            ]
+                "The internet is very slow here.",
+            ],
         }
 
         # Persona-specific fallback templates per state
@@ -282,7 +286,9 @@ class AgentReplyService:
                     fatigue_level,
                     effective_strategy,
                 )
-                logger.debug("LLM reply successful.", extra={"reply_source": self.llm_backend})
+                logger.debug(
+                    "LLM reply successful.", extra={"reply_source": self.llm_backend}
+                )
                 return reply
             except Exception as e:
                 # STRICT MODE: Crash if generation fails
@@ -299,7 +305,9 @@ class AgentReplyService:
                     fatigue_level,
                     effective_strategy,
                 )
-                logger.debug("Fell back to template reply.", extra={"reply_source": "template"})
+                logger.debug(
+                    "Fell back to template reply.", extra={"reply_source": "template"}
+                )
                 return reply
 
         # Check strict mode violation (LLM disabled but strict mode is on)
@@ -390,7 +398,8 @@ class AgentReplyService:
             for word in ["pay", "payment", "send", "upi", "paytm", "gpay", "transfer"]
         )
         has_account = any(
-            word in msg_lower for word in ["account", "bank", "kyc", "verify", "identity"]
+            word in msg_lower
+            for word in ["account", "bank", "kyc", "verify", "identity"]
         )
 
         filtered = []
@@ -457,22 +466,26 @@ class AgentReplyService:
         # Strategy-specific instructions
         strategy_instruction = ""
         if response_strategy == "clarify":
-            strategy_instruction = "Ask a specific question to clarify their request. Do NOT be vague."
+            strategy_instruction = (
+                "Ask a specific question to clarify their request. Do NOT be vague."
+            )
         elif response_strategy == "verify":
             strategy_instruction = "Express mild doubt. Ask for proof or verification. Do NOT simply refuse."
         elif response_strategy == "deflect":
             strategy_instruction = "Use a plausible excuse to delay action (e.g., busy, driving, need to ask someone). Do NOT ask questions."
         elif response_strategy == "boundary":
             strategy_instruction = "Be firm but polite. Set a boundary. Indicate you are disengaging or need to stop."
-        else: # Fallback for legacy strategy names or defaults
-             if response_strategy == "GUARDED_RESISTANCE":
-                 strategy_instruction = "Push back politely but firmly. Express mild doubt. Do NOT ask for more info."
-             elif response_strategy == "STRATEGIC_DELAY":
-                 strategy_instruction = "Use a realistic excuse to delay (e.g., driving, forgot glasses, need to ask someone). Do NOT ask questions."
-             elif response_strategy == "FATIGUED_DISENGAGEMENT":
-                 strategy_instruction = "Be short, dismissive, and sound like you are giving up on the conversation."
-             elif response_strategy == "CONFUSED_CLARIFICATION":
-                 strategy_instruction = "Ask a specific clarifying question about the request."
+        else:  # Fallback for legacy strategy names or defaults
+            if response_strategy == "GUARDED_RESISTANCE":
+                strategy_instruction = "Push back politely but firmly. Express mild doubt. Do NOT ask for more info."
+            elif response_strategy == "STRATEGIC_DELAY":
+                strategy_instruction = "Use a realistic excuse to delay (e.g., driving, forgot glasses, need to ask someone). Do NOT ask questions."
+            elif response_strategy == "FATIGUED_DISENGAGEMENT":
+                strategy_instruction = "Be short, dismissive, and sound like you are giving up on the conversation."
+            elif response_strategy == "CONFUSED_CLARIFICATION":
+                strategy_instruction = (
+                    "Ask a specific clarifying question about the request."
+                )
 
         # TASK 1: Update LLM SYSTEM PROMPT
         system_prompt = f"""You are simulating a real human being under possible scam pressure.
@@ -514,16 +527,13 @@ General Strategy Guide:
         if backend == "gemini":
             # --- GEMINI API CALL ---
             try:
-                model = genai.GenerativeModel('gemini-pro')
-                response = model.generate_content(
-                    full_prompt,
-                    request_options={"timeout": 2},
-                )
-                
+                model = genai.GenerativeModel("gemini-2.5-flash")
+                response = model.generate_content(full_prompt)
+
                 # Handling potential empty or blocked responses
                 if not response.parts:
                     raise ValueError("Gemini response was empty or blocked.")
-                
+
                 # Extract text, ensuring it's not None
                 reply_text = response.text
                 if reply_text is None:
@@ -532,7 +542,7 @@ General Strategy Guide:
                 return reply_text.strip()
             except Exception as e:
                 logger.error(f"Gemini API call failed: {e}. Falling back.")
-                raise e # Re-raise to trigger template fallback
+                raise e  # Re-raise to trigger template fallback
 
         elif backend == "local":
             # --- OLLAMA LOCAL CALL ---
@@ -550,14 +560,18 @@ General Strategy Guide:
                     f"{base_url}/api/generate",
                     json={"model": model_name, "prompt": full_prompt, "stream": True},
                     stream=True,
-                    timeout=(ollama_timeout, ollama_timeout) # Connect and read timeout set to ollama_timeout
+                    timeout=(
+                        ollama_timeout,
+                        ollama_timeout,
+                    ),  # Connect and read timeout set to ollama_timeout
                 )
                 response.raise_for_status()
-                
+
                 full_reply = ""
                 for line in response.iter_lines():
                     if line:
                         import json
+
                         try:
                             chunk = json.loads(line)
                             if "response" in chunk:
@@ -566,9 +580,9 @@ General Strategy Guide:
                                 break
                         except json.JSONDecodeError:
                             continue
-                            
+
                 full_reply = full_reply.strip()
-                
+
                 if full_reply:
                     return full_reply
                 else:
@@ -576,7 +590,7 @@ General Strategy Guide:
             except Exception as e:
                 logger.error(f"Local LLM call failed: {e}. Falling back.")
                 raise e  # Re-raise to trigger template fallback
-        
+
         else:
             # --- MOCK OR UNKNOWN BACKEND ---
             # Fallback for mock or any other non-configured backend

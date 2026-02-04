@@ -341,6 +341,7 @@ async def handle_message(
     # Update State if changed
     if next_state != session.agentState:
         session_manager.update_agent_state(session.sessionId, next_state)
+        session.agentState = next_state  # Update local object to reflect state change
         # Reset state turn count on transition
         session.stateTurnCount[session.agentState] = 0
     else:

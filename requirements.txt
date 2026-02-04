@@ -16,4 +16,4 @@ pytest==8.0.2
 
 # --- Optional: Cloud LLM APIs ---
 openai==1.12.0
-google-generativeai==0.3.2
+google-generativeai==0.8.3
