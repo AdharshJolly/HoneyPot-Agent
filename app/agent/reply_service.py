@@ -19,6 +19,9 @@ import random
 from typing import Optional, List
 import logging
 import requests
+import google.generativeai as genai
+import asyncio
+
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -41,9 +44,17 @@ class AgentReplyService:
         # Feature flag for easy toggling
         # CORRECTED: Standardized on USE_LLM
         self.use_llm = os.getenv("USE_LLM", "False").lower() == "true"
+        self.llm_backend = os.getenv("LLM_BACKEND", "mock").lower()
 
-        # API Key (placeholder for actual LLM client integration)
-        self.llm_api_key = os.getenv("LLM_API_KEY")
+        # API Key management
+        self.llm_api_key = None
+        if self.llm_backend == "gemini":
+            self.llm_api_key = os.getenv("GEMINI_API_KEY")
+            if not self.llm_api_key:
+                raise ValueError("LLM_BACKEND is 'gemini' but GEMINI_API_KEY is not set.")
+            genai.configure(api_key=self.llm_api_key)
+        else:
+            self.llm_api_key = os.getenv("LLM_API_KEY")
 
         # STRICT MODE: Enforce LLM requirement
         if self.strict_llm_mode:
@@ -54,7 +65,7 @@ class AgentReplyService:
                 )
             logger.info("STRICT_LLM_MODE active. Template fallback disabled.")
         elif self.use_llm:
-            logger.info("LLM generation enabled (with template fallback).")
+            logger.info(f"LLM generation enabled (backend: {self.llm_backend}, with template fallback).")
 
         # Persona Definitions (Data-driven tone control)
         # Used to influence LLM generation without changing state logic
@@ -263,7 +274,7 @@ class AgentReplyService:
         # Attempt LLM generation if enabled
         if self.use_llm:
             try:
-                return self._generate_with_llm(
+                reply = self._generate_with_llm(
                     agent_state,
                     scammer_message,
                     persona_name,
@@ -271,6 +282,8 @@ class AgentReplyService:
                     fatigue_level,
                     effective_strategy,
                 )
+                logger.debug("LLM reply successful.", extra={"reply_source": self.llm_backend})
+                return reply
             except Exception as e:
                 # STRICT MODE: Crash if generation fails
                 if self.strict_llm_mode:
@@ -279,26 +292,30 @@ class AgentReplyService:
 
                 # Log failure and fallback to templates
                 logger.error(f"LLM generation failed: {e}. Falling back to templates.")
-                return self._generate_with_templates(
+                reply = self._generate_with_templates(
                     agent_state,
                     scammer_message,
                     persona_name,
                     fatigue_level,
                     effective_strategy,
                 )
+                logger.debug("Fell back to template reply.", extra={"reply_source": "template"})
+                return reply
 
         # Check strict mode violation (LLM disabled but strict mode is on)
         if self.strict_llm_mode:
             raise ValueError("STRICT_LLM_MODE active but LLM disabled.")
 
         # Fallback to templates for all other cases (USE_LLM=False)
-        return self._generate_with_templates(
+        reply = self._generate_with_templates(
             agent_state,
             scammer_message,
             persona_name,
             fatigue_level,
             effective_strategy,
         )
+        logger.debug("Generated template reply.", extra={"reply_source": "template"})
+        return reply
 
     def _generate_with_templates(
         self,
@@ -492,9 +509,32 @@ General Strategy Guide:
         Reply (1 concise sentence):
         """
 
-        backend = os.getenv("LLM_BACKEND", "mock").lower()
+        backend = self.llm_backend
 
-        if backend == "local":
+        if backend == "gemini":
+            # --- GEMINI API CALL ---
+            try:
+                model = genai.GenerativeModel('gemini-pro')
+                response = model.generate_content(
+                    full_prompt,
+                    request_options={"timeout": 2},
+                )
+                
+                # Handling potential empty or blocked responses
+                if not response.parts:
+                    raise ValueError("Gemini response was empty or blocked.")
+                
+                # Extract text, ensuring it's not None
+                reply_text = response.text
+                if reply_text is None:
+                    raise ValueError("Gemini returned a null response text.")
+
+                return reply_text.strip()
+            except Exception as e:
+                logger.error(f"Gemini API call failed: {e}. Falling back.")
+                raise e # Re-raise to trigger template fallback
+
+        elif backend == "local":
             # --- OLLAMA LOCAL CALL ---
             # Privacy-safe, offline generation using LLaMA 3.1
             # CORRECTED: Configurable URL and Model
@@ -502,15 +542,15 @@ General Strategy Guide:
                 "/"
             )
             model_name = os.getenv("OLLAMA_MODEL", "llama3.1")
+            ollama_timeout = int(os.getenv("OLLAMA_TIMEOUT", "60"))
 
             try:
-                # Use streaming with NO read timeout to support long generation
-                # timeout=(connect_timeout, read_timeout) -> (5, None)
+                # Use configurable timeout for both connect and read
                 response = requests.post(
                     f"{base_url}/api/generate",
                     json={"model": model_name, "prompt": full_prompt, "stream": True},
                     stream=True,
-                    timeout=(5, None) 
+                    timeout=(ollama_timeout, ollama_timeout) # Connect and read timeout set to ollama_timeout
                 )
                 response.raise_for_status()
                 
@@ -535,19 +575,10 @@ General Strategy Guide:
                     raise ValueError("Empty response from Ollama")
             except Exception as e:
                 logger.error(f"Local LLM call failed: {e}. Falling back.")
-                raise e  # Re-raise to trigger template fallback in generate_reply
-
+                raise e  # Re-raise to trigger template fallback
+        
         else:
-            # --- MOCK API CALL (Default) ---
+            # --- MOCK OR UNKNOWN BACKEND ---
+            # Fallback for mock or any other non-configured backend
+            logger.debug(f"Using mock reply for backend: {backend}")
             return f"[LLM-{agent_state}] {self._generate_with_templates(agent_state, scammer_message, persona_name, fatigue_level, response_strategy)}"
-
-
-if __name__ == "__main__":
-    # Quick test
-    service = AgentReplyService()
-    print("Template:", service.generate_reply("CONFUSED", "Block account now"))
-
-    # Simulate LLM enabled
-    service.use_llm = True
-    service.llm_api_key = "dummy"
-    print("LLM Path:", service.generate_reply("TRUST_BUILDING", "Verify here"))
