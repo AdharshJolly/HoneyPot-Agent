@@ -183,10 +183,20 @@ app = FastAPI()
     },
     tags=["Health"],
 )
+@app.head(
+    "/health",
+    status_code=200,
+    responses={
+        200: {
+            "description": "Service is healthy and operational",
+        }
+    },
+    tags=["Health"],
+)
 async def healthcheck():
     """
     Health check endpoint for uptime monitoring.
-    Accepts both GET and POST methods.
+    Accepts GET, POST, and HEAD methods (HEAD is used by UptimeRobot).
 
     Returns:
     - 200: Service is healthy and operational
