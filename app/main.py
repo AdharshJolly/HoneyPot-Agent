@@ -154,6 +154,55 @@ async def verify_api_key(x_api_key: str = Header(...)):
 app = FastAPI()
 
 
+@app.get(
+    "/health",
+    status_code=200,
+    responses={
+        200: {
+            "description": "Service is healthy and operational",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "status": "healthy",
+                        "service": "honeypot-agent",
+                        "timestamp": "2026-02-05T12:34:56.789Z",
+                    }
+                }
+            },
+        }
+    },
+    tags=["Health"],
+)
+@app.post(
+    "/health",
+    status_code=200,
+    responses={
+        200: {
+            "description": "Service is healthy and operational",
+        }
+    },
+    tags=["Health"],
+)
+async def healthcheck():
+    """
+    Health check endpoint for uptime monitoring.
+    Accepts both GET and POST methods.
+
+    Returns:
+    - 200: Service is healthy and operational
+
+    This endpoint:
+    - Does not require authentication
+    - Returns quickly for monitoring tools
+    - Can be used by UptimeRobot, Pingdom, etc.
+    """
+    return {
+        "status": "healthy",
+        "service": "honeypot-agent",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 @app.post(
     "/honeypot/message",
     response_model=AgentMessageResponse,
@@ -374,7 +423,7 @@ async def handle_message(
     else:
         response_strategy = "boundary"
 
-    agent_reply = agent_reply_service.generate_reply(
+    agent_reply = await agent_reply_service.generate_reply(
         agent_state=session.agentState,
         scammer_message=current_text,
         persona_name=session.agentPersona,

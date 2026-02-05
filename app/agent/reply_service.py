@@ -21,6 +21,8 @@ import logging
 import requests
 import google.generativeai as genai
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 
 
 # Configure logging
@@ -236,7 +238,7 @@ class AgentReplyService:
             },
         }
 
-    def generate_reply(
+    async def generate_reply(
         self,
         agent_state: str,
         scammer_message: str,
@@ -246,7 +248,7 @@ class AgentReplyService:
         response_strategy: str = "CONFUSED_CLARIFICATION",
     ) -> str:
         """
-        Generate a reply based on state, input, and persona.
+        Generate a reply based on state, input, and persona (async for speed).
 
         Args:
             agent_state: The *already decided* behavioral state.
@@ -275,10 +277,14 @@ class AgentReplyService:
             logger.info("Confusion limit reached. Forcing GUARDED_RESISTANCE override.")
             effective_strategy = "GUARDED_RESISTANCE"
 
-        # Attempt LLM generation if enabled
+        # Attempt LLM generation if enabled (async for speed)
         if self.use_llm:
             try:
-                reply = self._generate_with_llm(
+                # Run in thread pool to avoid blocking event loop
+                loop = asyncio.get_event_loop()
+                reply = await loop.run_in_executor(
+                    None,
+                    self._generate_with_llm,
                     agent_state,
                     scammer_message,
                     persona_name,
@@ -437,7 +443,7 @@ class AgentReplyService:
 
         return unique_filtered[:max_candidates]
 
-    def _generate_with_llm(
+    async def generate_reply(
         self,
         agent_state: str,
         scammer_message: str,
@@ -487,47 +493,38 @@ class AgentReplyService:
                     "Ask a specific clarifying question about the request."
                 )
 
-        # TASK 1: Update LLM SYSTEM PROMPT
-        system_prompt = f"""You are simulating a real human being under possible scam pressure.
-Persona: {persona_desc}
+        # OPTIMIZED COMPACT PROMPT (Reduced from ~400 tokens to ~100 tokens)
+        system_prompt = f"""{persona_desc}
+State: {agent_state}. Strategy: {response_strategy}.
+{strategy_instruction}
+Rules: 1 short sentence, human-like, never comply, never accuse."""
 
-Current behavioral state: {agent_state}
-Current response strategy: {response_strategy}
-Strategy Instruction: {strategy_instruction}
-Fatigue level: {fatigue_level}
+        # Only include last 2 context messages if available
+        compact_context = ""
+        if recent_user_context and len(recent_user_context) > 0:
+            compact_context = "\n".join(recent_user_context[-2:])
 
-IMPORTANT RULES:
-- Never repeat the same type of response twice in a row.
-- If confusion has already been expressed, shift to resistance or delay.
-- Do NOT ask clarifying questions more than once per strategy if you are repeating yourself.
-- Sound human, not procedural.
-- Keep responses short (1 sentence) and emotionally consistent.
-- NEVER accuse the scammer.
-- NEVER provide real credentials.
-- NEVER comply with requests for OTPs or account numbers.
-
-General Strategy Guide:
-- clarify: Ask ONE clarifying question, then move on.
-- verify: Express mild doubt. Ask for proof or verification. Do NOT simply refuse.
-- deflect: Use a plausible excuse to delay action (e.g., busy, driving, need to ask someone). Do NOT ask questions.
-- boundary: Be firm but polite. Set a boundary. Indicate you are disengaging or need to stop."""
-
-        full_prompt = f"""
-        {system_prompt}
-        
-        {context_str}
-        
-        Latest Incoming Message: "{scammer_message}"
-        
-        Reply (1 concise sentence):
-        """
+        full_prompt = f"""{system_prompt}
+{compact_context}
+Scammer: {scammer_message}
+Reply:"""
 
         backend = self.llm_backend
 
         if backend == "gemini":
-            # --- GEMINI API CALL ---
+            # --- OPTIMIZED GEMINI API CALL (Max speed settings) ---
             try:
-                model = genai.GenerativeModel("gemini-2.5-flash")
+                # Use fastest model with aggressive speed optimizations
+                model = genai.GenerativeModel(
+                    model_name="gemini-2.5-flash",
+                    generation_config={
+                        "temperature": 0.7,
+                        "max_output_tokens": 30,  # Very short for 1 sentence (faster)
+                        "top_p": 0.9,
+                        "top_k": 20,
+                    },
+                )
+
                 response = model.generate_content(full_prompt)
 
                 # Handling potential empty or blocked responses
