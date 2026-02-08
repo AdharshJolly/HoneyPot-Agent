@@ -51,6 +51,20 @@ curl -X POST http://127.0.0.1:8000/honeypot/message \
   -d "{\"sessionId\": \"demo-1\", \"message\": {\"sender\": \"scammer\", \"text\": \"Your account is blocked, verify now\", \"timestamp\": 1738972800000}}"
 ```
 
+## Docker Compose
+
+Run the API with Redis and Postgres using Docker Compose:
+
+```
+docker compose up --build
+```
+
+Notes:
+
+- Compose sets `SESSION_STORE=redis_postgres` and wires Redis/Postgres automatically.
+- Update `.env` to set `HONEYPOT_API_KEY` and any callback settings before running.
+- Exported intelligence snapshots are persisted to `./exports`.
+
 ## Optional display export
 
 Set these variables to write redacted intelligence snapshots to JSONL:
