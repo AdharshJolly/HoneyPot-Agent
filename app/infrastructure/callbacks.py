@@ -38,17 +38,10 @@ class FinalCallbackDispatcher:
     def __init__(self, session_manager: SessionManager):
         self.session_manager = session_manager
 
-        # CORRECTED: Load from environment or fail
+        # Load from environment; must be configured for production
         self.callback_url = os.getenv("FINAL_CALLBACK_URL")
         if not self.callback_url:
-            # Fallback to legacy default if strict validation allows,
-            # otherwise raise error as per instructions "Fail clearly"
-            logger.warning(
-                "FINAL_CALLBACK_URL not set. Defaulting to hackathon endpoint."
-            )
-            self.callback_url = (
-                "https://hackathon.guvi.in/api/updateHoneyPotFinalResult"
-            )
+            logger.error("FINAL_CALLBACK_URL is not configured. Callback disabled.")
 
         self.api_key = os.getenv("CALLBACK_API_KEY")
 
@@ -92,7 +85,9 @@ class FinalCallbackDispatcher:
 
         # TRIGGER CONDITIONS check
         if not self._should_trigger_callback(session):
-            logger.info(f"Callback conditions NOT met for {session_id}. State={session.agentState}, ScamDetected={session.scamDetected}")
+            logger.info(
+                f"Callback conditions NOT met for {session_id}. State={session.agentState}, ScamDetected={session.scamDetected}"
+            )
             return False
 
         # Prepare Payload
@@ -143,7 +138,7 @@ class FinalCallbackDispatcher:
         """
         # Generate hybrid agent notes (Deterministic + Optional LLM)
         final_notes = self._generate_hybrid_agent_notes(session)
-        
+
         # Update session with final notes for consistency
         session.agentNotes = final_notes
 
@@ -175,15 +170,17 @@ class FinalCallbackDispatcher:
 
         # 2. Optional LLM Enrichment (STRICTLY LIMITED)
         use_llm_notes = os.getenv("USE_LLM_AGENT_NOTES", "false").lower() == "true"
-        
+
         if use_llm_notes:
             try:
                 enriched_notes = self._enrich_notes_with_llm(base_notes)
                 if enriched_notes:
                     return enriched_notes
             except Exception as e:
-                logger.warning(f"LLM agentNotes enrichment failed: {e}. Falling back to base notes.")
-        
+                logger.warning(
+                    f"LLM agentNotes enrichment failed: {e}. Falling back to base notes."
+                )
+
         return base_notes
 
     def _build_base_agent_notes(self, session: Session) -> str:
@@ -192,19 +189,34 @@ class FinalCallbackDispatcher:
         """
         indicators = []
         intel = session.extractedIntelligence
-        
+
         # Financial Credentials
         if intel.bankAccounts:
             indicators.append("Attempted financial credential extraction")
-            
+
         # Urgency/Pressure
-        urgency_terms = {"urgent", "immediately", "verify now", "block", "suspend", "expire", "act now"}
-        if any(term in k.lower() for term in urgency_terms for k in intel.suspiciousKeywords):
+        urgency_terms = {
+            "urgent",
+            "immediately",
+            "verify now",
+            "block",
+            "suspend",
+            "expire",
+            "act now",
+        }
+        if any(
+            term in k.lower()
+            for term in urgency_terms
+            for k in intel.suspiciousKeywords
+        ):
             indicators.append("Urgency and pressure tactics used")
-            
+
         # Impersonation (inferred from bank keywords/context)
-        if "account" in str(intel.suspiciousKeywords).lower() or "bank" in str(intel.suspiciousKeywords).lower():
-             indicators.append("Impersonation of bank authority")
+        if (
+            "account" in str(intel.suspiciousKeywords).lower()
+            or "bank" in str(intel.suspiciousKeywords).lower()
+        ):
+            indicators.append("Impersonation of bank authority")
 
         # External Redirection
         if intel.phishingLinks:
@@ -227,14 +239,14 @@ class FinalCallbackDispatcher:
         """
         # Only support Local/Ollama for this specific optional feature to keep it lightweight
         # or reuse the environment config if valid.
-        
+
         backend = os.getenv("LLM_BACKEND", "local").lower()
         if backend != "local":
-            return None # Skip for non-local to avoid complexity in this helper for now
+            return None  # Skip for non-local to avoid complexity in this helper for now
 
         base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
         model_name = os.getenv("OLLAMA_MODEL", "llama3.1")
-        
+
         prompt = (
             f"Task: Rewrite these scam indicators into ONE concise, professional analyst sentence.\n"
             f"Input: {base_notes}\n"
@@ -246,20 +258,23 @@ class FinalCallbackDispatcher:
             response = requests.post(
                 f"{base_url}/api/generate",
                 json={"model": model_name, "prompt": prompt, "stream": False},
-                timeout=5
+                timeout=5,
             )
             if response.status_code == 200:
                 result = response.json().get("response", "").strip()
                 return result if result else None
         except Exception:
             return None
-        
+
         return None
 
     def _send_callback(self, payload: Dict[str, Any]) -> bool:
         """
         Execute the POST request with error handling.
         """
+        if not self.callback_url:
+            logger.error("Callback URL missing; cannot dispatch final callback.")
+            return False
         try:
             logger.info("Sending final callback...")
 
@@ -267,7 +282,17 @@ class FinalCallbackDispatcher:
             if self.api_key:
                 headers["x-api-key"] = self.api_key
 
-            logger.debug(f"Sending callback payload: {payload}")
+            intel = payload.get("extractedIntelligence", {})
+            intel_counts = {
+                key: len(value)
+                for key, value in intel.items()
+                if isinstance(value, list)
+            }
+            logger.debug(
+                "Sending callback payload summary: sessionId=%s, intelCounts=%s",
+                payload.get("sessionId"),
+                intel_counts,
+            )
 
             response = self._http_client.post(
                 self.callback_url, json=payload, headers=headers, timeout=10

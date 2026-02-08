@@ -34,9 +34,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-from fastapi import FastAPI, HTTPException, Header, Depends, status, BackgroundTasks
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    Header,
+    Depends,
+    status,
+    BackgroundTasks,
+    Request,
+)
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from fastapi.exceptions import RequestValidationError
+from pydantic import BaseModel, Field, validator
 from typing import List, Optional, Dict, Any, Union
 from datetime import datetime, timezone
 from app.agent.controller import (
@@ -48,6 +57,7 @@ from app.agent.controller import (
 )
 from app.core.intelligence import IntelligenceExtractionEngine
 from app.infrastructure.callbacks import FinalCallbackDispatcher
+from app.infrastructure.intel_exporter import IntelligenceExporter
 from app.agent.reply_service import AgentReplyService
 from app.core.session import SessionManager, Session
 
@@ -91,7 +101,20 @@ class ScamDetectionEngine:
 class IncomingMessage(BaseModel):
     sender: str
     text: str
-    timestamp: int
+    timestamp: int = Field(ge=0)
+
+    @validator("sender")
+    def validate_sender(cls, value: str) -> str:
+        allowed = {"scammer", "user"}
+        if value not in allowed:
+            raise ValueError("Invalid sender")
+        return value
+
+    @validator("text")
+    def validate_text(cls, value: str) -> str:
+        if not value or not value.strip():
+            raise ValueError("Message text is required")
+        return value
 
 
 class MetadataModel(BaseModel):
@@ -125,6 +148,11 @@ class AgentMessageResponse(BaseModel):
     reply: str
 
 
+class ErrorResponse(BaseModel):
+    status: str = "error"
+    message: str
+
+
 # --- Dependencies ---
 
 # Singleton instances
@@ -133,6 +161,7 @@ agent_controller = AgentController()
 intelligence_engine = IntelligenceExtractionEngine()
 scam_engine = ScamDetectionEngine()
 callback_dispatcher = FinalCallbackDispatcher(session_manager)
+intel_exporter = IntelligenceExporter()
 agent_reply_service = AgentReplyService()
 
 # API Key Validation
@@ -152,6 +181,25 @@ async def verify_api_key(x_api_key: str = Header(...)):
 # --- Application ---
 
 app = FastAPI()
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    logger.warning("Validation error on %s: %s", request.url.path, exc)
+    return JSONResponse(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        content=ErrorResponse(message="Invalid request payload").dict(),
+    )
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    logger.warning("HTTP error on %s: %s", request.url.path, exc.detail)
+    message = exc.detail if isinstance(exc.detail, str) else "Request failed"
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=ErrorResponse(message=message).dict(),
+    )
 
 
 @app.get(
@@ -236,12 +284,17 @@ async def handle_message(
     - 200: Agent reply generated for active or closed session.
     """
 
+    # 0. Prune expired sessions to keep memory bounded
+    removed_count = session_manager.prune_expired_sessions()
+    if removed_count > 0:
+        logger.info("Pruned %s expired sessions", removed_count)
+
     # 1. Load or Create Session (Robust Handling for testers)
     # Generate UUID if missing
     session_id = request.sessionId or str(uuid.uuid4())
     session = session_manager.get_or_create_session(session_id)
 
-    # 2. Check Session Lifecycle - Return 200 OK for closed sessions as per hackathon spec
+    # 2. Check Session Lifecycle - Return 200 OK for closed sessions
     if session.sessionClosed:
         # For closed sessions, return a 200 OK with a consistent reply message.
         # Try to get the last agent reply from conversation history.
@@ -314,6 +367,9 @@ async def handle_message(
         session.extractedIntelligence.suspiciousKeywords,
         extracted_data["suspiciousKeywords"],
     )
+
+    # Optional export for display and auditing (redacted)
+    intel_exporter.export_snapshot(session)
 
     # Update Sufficient Intelligence Flag
     has_intel = (

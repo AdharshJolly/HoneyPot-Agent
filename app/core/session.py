@@ -16,14 +16,18 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, field, asdict
 from copy import deepcopy
+from contextlib import contextmanager
+import os
 import random
+import threading
 
 AVAILABLE_PERSONAS = [
     "confused_elderly",
     "busy_professional",
     "naive_student",
-    "skeptical_user"
+    "skeptical_user",
 ]
+
 
 @dataclass
 class Message:
@@ -107,17 +111,22 @@ class Session:
     # Redundancy tracking (Option B)
     redundantScammerMessageCount: int = 0
     hasSufficientIntelligence: bool = False
-    
+
     # Conversation Pacing Control (Task 1)
-    stateTurnCount: Dict[str, int] = field(default_factory=lambda: {
-        "INIT": 0, "CONFUSED": 0, "TRUST_BUILDING": 0, 
-        "INFORMATION_EXTRACTION": 0, "EXIT": 0
-    })
+    stateTurnCount: Dict[str, int] = field(
+        default_factory=lambda: {
+            "INIT": 0,
+            "CONFUSED": 0,
+            "TRUST_BUILDING": 0,
+            "INFORMATION_EXTRACTION": 0,
+            "EXIT": 0,
+        }
+    )
     stallCount: int = 0  # Number of stall tactics used
-    
+
     # Repetition Fatigue (Tone Control)
     repetitionFatigueLevel: int = 0  # 0-3 scale: normal -> fatigued
-    
+
     # Behavioral Realism (Option C)
     responseStrategy: str = "CONFUSED_CLARIFICATION"
 
@@ -138,11 +147,89 @@ class SessionManager:
 
     Storage:
     - In-memory dictionary keyed by sessionId
-    - Suitable for hackathon/demo (can upgrade to Redis later)
+    - Suitable for local demo (can upgrade to Redis later)
     """
 
     def __init__(self):
         self._sessions: Dict[str, Session] = {}
+        self._session_locks: Dict[str, threading.RLock] = {}
+        self._global_lock = threading.RLock()
+
+        # TTL defaults to disabled (0 or missing). Use env to enable without API changes.
+        ttl_env = os.getenv("SESSION_TTL_SECONDS", "0").strip()
+        try:
+            self._session_ttl_seconds = max(int(ttl_env), 0)
+        except ValueError:
+            self._session_ttl_seconds = 0
+
+        max_env = os.getenv("MAX_SESSIONS", "0").strip()
+        try:
+            self._max_sessions = max(int(max_env), 0)
+        except ValueError:
+            self._max_sessions = 0
+
+    def _get_session_lock(self, session_id: str) -> threading.RLock:
+        with self._global_lock:
+            lock = self._session_locks.get(session_id)
+            if lock is None:
+                lock = threading.RLock()
+                self._session_locks[session_id] = lock
+            return lock
+
+    @contextmanager
+    def _locked_session(self, session_id: str):
+        lock = self._get_session_lock(session_id)
+        with lock:
+            yield
+
+    def _is_expired(self, session: Session, now: datetime) -> bool:
+        if self._session_ttl_seconds <= 0:
+            return False
+        try:
+            last_updated = datetime.fromisoformat(session.lastUpdatedAt)
+        except ValueError:
+            return False
+        age_seconds = int((now - last_updated).total_seconds())
+        return age_seconds > self._session_ttl_seconds
+
+    def prune_expired_sessions(self) -> int:
+        """
+        Remove expired sessions to keep memory bounded.
+
+        Returns:
+            Number of sessions removed.
+        """
+        if self._session_ttl_seconds <= 0 and self._max_sessions <= 0:
+            return 0
+
+        now = datetime.now(timezone.utc)
+        removed = 0
+
+        with self._global_lock:
+            if self._session_ttl_seconds > 0:
+                expired_ids = [
+                    sid
+                    for sid, session in self._sessions.items()
+                    if self._is_expired(session, now)
+                ]
+                for sid in expired_ids:
+                    self._sessions.pop(sid, None)
+                    self._session_locks.pop(sid, None)
+                    removed += 1
+
+            if self._max_sessions > 0 and len(self._sessions) > self._max_sessions:
+                # Remove oldest by lastUpdatedAt to enforce cap.
+                sorted_ids = sorted(
+                    self._sessions.keys(),
+                    key=lambda sid: self._sessions[sid].lastUpdatedAt,
+                )
+                while len(self._sessions) > self._max_sessions and sorted_ids:
+                    sid = sorted_ids.pop(0)
+                    self._sessions.pop(sid, None)
+                    self._session_locks.pop(sid, None)
+                    removed += 1
+
+        return removed
 
     def get_or_create_session(self, session_id: str) -> Session:
         """
@@ -159,24 +246,27 @@ class SessionManager:
         Returns:
             Session object (existing or newly created)
         """
-        if session_id in self._sessions:
-            return self._sessions[session_id]
+        with self._global_lock:
+            if session_id in self._sessions:
+                return self._sessions[session_id]
 
         # Create new session with default initial state
         now = datetime.now(timezone.utc).isoformat()
         # WHY: Persona is selected once at creation and remains immutable for the session.
         # This ensures consistent voice/tone throughout the engagement.
         selected_persona = random.choice(AVAILABLE_PERSONAS)
-        
+
         new_session = Session(
-            sessionId=session_id, 
-            createdAt=now, 
+            sessionId=session_id,
+            createdAt=now,
             lastUpdatedAt=now,
-            agentPersona=selected_persona
+            agentPersona=selected_persona,
         )
 
-        self._sessions[session_id] = new_session
-        return new_session
+        with self._global_lock:
+            self._sessions[session_id] = new_session
+            self._session_locks.setdefault(session_id, threading.RLock())
+            return new_session
 
     def append_message(
         self, session_id: str, sender: str, text: str, timestamp: Optional[str] = None
@@ -202,21 +292,22 @@ class SessionManager:
         Raises:
             ValueError: If session is closed
         """
-        session = self._sessions.get(session_id)
-        if not session:
-            raise ValueError(f"Session {session_id} does not exist")
+        with self._locked_session(session_id):
+            session = self._sessions.get(session_id)
+            if not session:
+                raise ValueError(f"Session {session_id} does not exist")
 
-        # TERMINAL FLAG CHECK: Cannot modify closed sessions
-        if session.sessionClosed:
-            raise ValueError(f"Session {session_id} is closed and immutable")
+            # TERMINAL FLAG CHECK: Cannot modify closed sessions
+            if session.sessionClosed:
+                raise ValueError(f"Session {session_id} is closed and immutable")
 
-        if timestamp is None:
-            timestamp = datetime.now(timezone.utc).isoformat()
+            if timestamp is None:
+                timestamp = datetime.now(timezone.utc).isoformat()
 
-        message = Message(sender=sender, text=text, timestamp=timestamp)
-        session.conversationHistory.append(message)
-        session.totalMessagesExchanged += 1
-        session.lastUpdatedAt = datetime.now(timezone.utc).isoformat()
+            message = Message(sender=sender, text=text, timestamp=timestamp)
+            session.conversationHistory.append(message)
+            session.totalMessagesExchanged += 1
+            session.lastUpdatedAt = datetime.now(timezone.utc).isoformat()
 
     def mark_scam_detected(self, session_id: str, confidence: float) -> None:
         """
@@ -237,24 +328,25 @@ class SessionManager:
         Raises:
             ValueError: If session doesn't exist or is closed
         """
-        session = self._sessions.get(session_id)
-        if not session:
-            raise ValueError(f"Session {session_id} does not exist")
+        with self._locked_session(session_id):
+            session = self._sessions.get(session_id)
+            if not session:
+                raise ValueError(f"Session {session_id} does not exist")
 
-        if session.sessionClosed:
-            raise ValueError(f"Session {session_id} is closed")
+            if session.sessionClosed:
+                raise ValueError(f"Session {session_id} is closed")
 
-        # Set detection flag
-        session.scamDetected = True
-        session.scamConfidence = confidence
+            # Set detection flag
+            session.scamDetected = True
+            session.scamConfidence = confidence
 
-        # Record engagement start time (only on first detection)
-        if session.engagementMetrics.engagementStartTime is None:
-            session.engagementMetrics.engagementStartTime = datetime.now(
-                timezone.utc
-            ).isoformat()
+            # Record engagement start time (only on first detection)
+            if session.engagementMetrics.engagementStartTime is None:
+                session.engagementMetrics.engagementStartTime = datetime.now(
+                    timezone.utc
+                ).isoformat()
 
-        session.lastUpdatedAt = datetime.now(timezone.utc).isoformat()
+            session.lastUpdatedAt = datetime.now(timezone.utc).isoformat()
 
     def update_agent_state(self, session_id: str, new_state: str) -> None:
         """
@@ -288,22 +380,23 @@ class SessionManager:
         if new_state not in valid_states:
             raise ValueError(f"Invalid agent state: {new_state}")
 
-        session = self._sessions.get(session_id)
-        if not session:
-            raise ValueError(f"Session {session_id} does not exist")
+        with self._locked_session(session_id):
+            session = self._sessions.get(session_id)
+            if not session:
+                raise ValueError(f"Session {session_id} does not exist")
 
-        if session.sessionClosed:
-            raise ValueError(f"Session {session_id} is closed")
+            if session.sessionClosed:
+                raise ValueError(f"Session {session_id} is closed")
 
-        # TERMINAL STATE PROTECTION: EXIT is irreversible
-        # Agent Controller owns transition logic, but SessionManager protects terminal states
-        if session.agentState == "EXIT":
-            raise ValueError(
-                f"Cannot transition from EXIT state (terminal). Current: EXIT, Requested: {new_state}"
-            )
+            # TERMINAL STATE PROTECTION: EXIT is irreversible
+            # Agent Controller owns transition logic, but SessionManager protects terminal states
+            if session.agentState == "EXIT":
+                raise ValueError(
+                    f"Cannot transition from EXIT state (terminal). Current: EXIT, Requested: {new_state}"
+                )
 
-        session.agentState = new_state
-        session.lastUpdatedAt = datetime.now(timezone.utc).isoformat()
+            session.agentState = new_state
+            session.lastUpdatedAt = datetime.now(timezone.utc).isoformat()
 
     def mark_callback_sent(self, session_id: str) -> None:
         """
@@ -322,20 +415,21 @@ class SessionManager:
         Raises:
             ValueError: If session doesn't exist, is closed, or callback already sent
         """
-        session = self._sessions.get(session_id)
-        if not session:
-            raise ValueError(f"Session {session_id} does not exist")
+        with self._locked_session(session_id):
+            session = self._sessions.get(session_id)
+            if not session:
+                raise ValueError(f"Session {session_id} does not exist")
 
-        if session.sessionClosed:
-            raise ValueError(f"Session {session_id} is closed")
+            if session.sessionClosed:
+                raise ValueError(f"Session {session_id} is closed")
 
-        # Prevent duplicate callback marking
-        if session.callbackSent:
-            raise ValueError(f"Callback already sent for session {session_id}")
+            # Prevent duplicate callback marking
+            if session.callbackSent:
+                raise ValueError(f"Callback already sent for session {session_id}")
 
-        # TERMINAL FLAG: Irreversible
-        session.callbackSent = True
-        session.lastUpdatedAt = datetime.now(timezone.utc).isoformat()
+            # TERMINAL FLAG: Irreversible
+            session.callbackSent = True
+            session.lastUpdatedAt = datetime.now(timezone.utc).isoformat()
 
     def close_session(self, session_id: str) -> None:
         """
@@ -359,16 +453,17 @@ class SessionManager:
         Raises:
             ValueError: If session doesn't exist or already closed
         """
-        session = self._sessions.get(session_id)
-        if not session:
-            raise ValueError(f"Session {session_id} does not exist")
+        with self._locked_session(session_id):
+            session = self._sessions.get(session_id)
+            if not session:
+                raise ValueError(f"Session {session_id} does not exist")
 
-        if session.sessionClosed:
-            raise ValueError(f"Session {session_id} is already closed")
+            if session.sessionClosed:
+                raise ValueError(f"Session {session_id} is already closed")
 
-        # TERMINAL FLAG: Irreversible
-        session.sessionClosed = True
-        session.lastUpdatedAt = datetime.now(timezone.utc).isoformat()
+            # TERMINAL FLAG: Irreversible
+            session.sessionClosed = True
+            session.lastUpdatedAt = datetime.now(timezone.utc).isoformat()
 
     def get_session(self, session_id: str) -> Optional[Session]:
         """
@@ -379,11 +474,13 @@ class SessionManager:
         Returns:
             Session object or None if not found
         """
-        return self._sessions.get(session_id)
+        with self._locked_session(session_id):
+            return self._sessions.get(session_id)
 
     def session_exists(self, session_id: str) -> bool:
         """Check if session exists in storage."""
-        return session_id in self._sessions
+        with self._global_lock:
+            return session_id in self._sessions
 
     def is_session_closed(self, session_id: str) -> bool:
         """
@@ -393,8 +490,9 @@ class SessionManager:
         - Closed sessions must reject new incoming messages
         - API should return 409 Conflict for closed session requests
         """
-        session = self._sessions.get(session_id)
-        return session.sessionClosed if session else False
+        with self._locked_session(session_id):
+            session = self._sessions.get(session_id)
+            return session.sessionClosed if session else False
 
     def to_dict(self, session_id: str) -> Optional[Dict[str, Any]]:
         """
@@ -408,9 +506,10 @@ class SessionManager:
         Returns:
             Dictionary representation or None if session not found
         """
-        session = self._sessions.get(session_id)
-        if not session:
-            return None
+        with self._locked_session(session_id):
+            session = self._sessions.get(session_id)
+            if not session:
+                return None
 
-        # Deep copy to prevent external mutation
-        return deepcopy(asdict(session))
+            # Deep copy to prevent external mutation
+            return deepcopy(asdict(session))
