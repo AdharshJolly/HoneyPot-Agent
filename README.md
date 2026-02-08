@@ -90,3 +90,4 @@ pytest
 - Enforce TLS and rate limiting at the gateway
 - Keep the callback endpoint private and authenticated
 - Avoid logging raw extracted values
+- Use Redis + Postgres for durable sessions in production

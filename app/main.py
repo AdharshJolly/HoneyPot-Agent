@@ -58,6 +58,7 @@ from app.agent.controller import (
 from app.core.intelligence import IntelligenceExtractionEngine
 from app.infrastructure.callbacks import FinalCallbackDispatcher
 from app.infrastructure.intel_exporter import IntelligenceExporter
+from app.infrastructure.session_store import create_session_store_from_env
 from app.agent.reply_service import AgentReplyService
 from app.core.session import SessionManager, Session
 
@@ -156,13 +157,33 @@ class ErrorResponse(BaseModel):
 # --- Dependencies ---
 
 # Singleton instances
-session_manager = SessionManager()
+session_store = create_session_store_from_env()
+session_manager = SessionManager(store=session_store)
 agent_controller = AgentController()
 intelligence_engine = IntelligenceExtractionEngine()
 scam_engine = ScamDetectionEngine()
 callback_dispatcher = FinalCallbackDispatcher(session_manager)
 intel_exporter = IntelligenceExporter()
 agent_reply_service = AgentReplyService()
+
+
+def build_final_summary(session: Session) -> Dict[str, Any]:
+    return {
+        "scamDetected": session.scamDetected,
+        "agentNotes": session.agentNotes,
+        "engagementMetrics": {
+            "engagementDurationSeconds": session.engagementMetrics.engagementDurationSeconds,
+            "totalMessagesExchanged": session.totalMessagesExchanged,
+        },
+        "extractedIntelligence": {
+            "bankAccounts": session.extractedIntelligence.bankAccounts,
+            "upiIds": session.extractedIntelligence.upiIds,
+            "phoneNumbers": session.extractedIntelligence.phoneNumbers,
+            "phishingLinks": session.extractedIntelligence.phishingLinks,
+            "suspiciousKeywords": session.extractedIntelligence.suspiciousKeywords,
+        },
+    }
+
 
 # API Key Validation
 API_KEY_NAME = "x-api-key"
@@ -294,28 +315,22 @@ async def handle_message(
     session_id = request.sessionId or str(uuid.uuid4())
     session = session_manager.get_or_create_session(session_id)
 
-    # 2. Check Session Lifecycle - Return 200 OK for closed sessions
+    # 2. Check Session Lifecycle - Return 409 for closed sessions
     if session.sessionClosed:
-        # For closed sessions, return a 200 OK with a consistent reply message.
-        # Try to get the last agent reply from conversation history.
-        # If no agent messages, provide a default message.
-        last_agent_message = next(
-            (
-                msg.text
-                for msg in reversed(session.conversationHistory)
-                if msg.sender == "agent"
-            ),
-            None,
-        )
-        final_reply_for_closed_session = (
-            last_agent_message
-            if last_agent_message
-            else "The conversation has ended. Thank you for your messages."
-        )
         logger.info(
-            f"Session {session.sessionId} is closed. Returning consistent 200 OK response."
+            "Session %s is closed. Returning 409 summary response.",
+            session.sessionId,
         )
-        return AgentMessageResponse(reply=final_reply_for_closed_session)
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={
+                "status": "session_closed",
+                "message": "Conversation has already ended.",
+                "sessionId": session.sessionId,
+                "finalCallbackSent": session.callbackSent,
+                "finalSummary": build_final_summary(session),
+            },
+        )
 
     # 3. Append Scammer Message
     session_manager.append_message(

@@ -13,13 +13,16 @@ CRITICAL RULES:
 """
 
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Any
-from dataclasses import dataclass, field, asdict
+from typing import Dict, List, Optional, Any, TYPE_CHECKING
+from dataclasses import dataclass, field, asdict, fields as dataclass_fields
 from copy import deepcopy
 from contextlib import contextmanager
 import os
 import random
 import threading
+
+if TYPE_CHECKING:
+    from app.infrastructure.session_store import SessionStore
 
 AVAILABLE_PERSONAS = [
     "confused_elderly",
@@ -135,6 +138,36 @@ class Session:
     sessionClosed: bool = False
 
 
+def session_to_dict(session: Session) -> Dict[str, Any]:
+    """Serialize a session to a JSON-safe dictionary."""
+    return deepcopy(asdict(session))
+
+
+def session_from_dict(data: Dict[str, Any]) -> Session:
+    """Rehydrate a session from a dictionary payload."""
+    field_names = {field.name for field in dataclass_fields(Session)}
+    filtered: Dict[str, Any] = {k: v for k, v in data.items() if k in field_names}
+
+    history = filtered.get("conversationHistory", [])
+    filtered["conversationHistory"] = [
+        Message(**item) if isinstance(item, dict) else item for item in history
+    ]
+
+    metrics = filtered.get("engagementMetrics") or {}
+    filtered["engagementMetrics"] = (
+        EngagementMetrics(**metrics) if isinstance(metrics, dict) else metrics
+    )
+
+    intelligence = filtered.get("extractedIntelligence") or {}
+    filtered["extractedIntelligence"] = (
+        ExtractedIntelligence(**intelligence)
+        if isinstance(intelligence, dict)
+        else intelligence
+    )
+
+    return Session(**filtered)
+
+
 class SessionManager:
     """
     Manages session lifecycle with strict enforcement of terminal flags.
@@ -150,10 +183,11 @@ class SessionManager:
     - Suitable for local demo (can upgrade to Redis later)
     """
 
-    def __init__(self):
+    def __init__(self, store: Optional["SessionStore"] = None):
         self._sessions: Dict[str, Session] = {}
         self._session_locks: Dict[str, threading.RLock] = {}
         self._global_lock = threading.RLock()
+        self._store = store
 
         # TTL defaults to disabled (0 or missing). Use env to enable without API changes.
         ttl_env = os.getenv("SESSION_TTL_SECONDS", "0").strip()
@@ -175,6 +209,11 @@ class SessionManager:
                 lock = threading.RLock()
                 self._session_locks[session_id] = lock
             return lock
+
+    def _persist(self, session: Session) -> None:
+        if not self._store:
+            return
+        self._store.save(session)
 
     @contextmanager
     def _locked_session(self, session_id: str):
@@ -250,6 +289,14 @@ class SessionManager:
             if session_id in self._sessions:
                 return self._sessions[session_id]
 
+        if self._store:
+            stored = self._store.get(session_id)
+            if stored:
+                with self._global_lock:
+                    self._sessions[session_id] = stored
+                    self._session_locks.setdefault(session_id, threading.RLock())
+                return stored
+
         # Create new session with default initial state
         now = datetime.now(timezone.utc).isoformat()
         # WHY: Persona is selected once at creation and remains immutable for the session.
@@ -266,7 +313,9 @@ class SessionManager:
         with self._global_lock:
             self._sessions[session_id] = new_session
             self._session_locks.setdefault(session_id, threading.RLock())
-            return new_session
+
+        self._persist(new_session)
+        return new_session
 
     def append_message(
         self, session_id: str, sender: str, text: str, timestamp: Optional[str] = None
@@ -308,6 +357,7 @@ class SessionManager:
             session.conversationHistory.append(message)
             session.totalMessagesExchanged += 1
             session.lastUpdatedAt = datetime.now(timezone.utc).isoformat()
+            self._persist(session)
 
     def mark_scam_detected(self, session_id: str, confidence: float) -> None:
         """
@@ -347,6 +397,7 @@ class SessionManager:
                 ).isoformat()
 
             session.lastUpdatedAt = datetime.now(timezone.utc).isoformat()
+            self._persist(session)
 
     def update_agent_state(self, session_id: str, new_state: str) -> None:
         """
@@ -397,6 +448,7 @@ class SessionManager:
 
             session.agentState = new_state
             session.lastUpdatedAt = datetime.now(timezone.utc).isoformat()
+            self._persist(session)
 
     def mark_callback_sent(self, session_id: str) -> None:
         """
@@ -430,6 +482,7 @@ class SessionManager:
             # TERMINAL FLAG: Irreversible
             session.callbackSent = True
             session.lastUpdatedAt = datetime.now(timezone.utc).isoformat()
+            self._persist(session)
 
     def close_session(self, session_id: str) -> None:
         """
@@ -464,6 +517,7 @@ class SessionManager:
             # TERMINAL FLAG: Irreversible
             session.sessionClosed = True
             session.lastUpdatedAt = datetime.now(timezone.utc).isoformat()
+            self._persist(session)
 
     def get_session(self, session_id: str) -> Optional[Session]:
         """
@@ -475,7 +529,19 @@ class SessionManager:
             Session object or None if not found
         """
         with self._locked_session(session_id):
-            return self._sessions.get(session_id)
+            session = self._sessions.get(session_id)
+            if session:
+                return session
+
+        if self._store:
+            stored = self._store.get(session_id)
+            if stored:
+                with self._global_lock:
+                    self._sessions[session_id] = stored
+                    self._session_locks.setdefault(session_id, threading.RLock())
+            return stored
+
+        return None
 
     def session_exists(self, session_id: str) -> bool:
         """Check if session exists in storage."""
