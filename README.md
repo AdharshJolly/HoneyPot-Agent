@@ -1,107 +1,196 @@
-# Agentic Honey-Pot System
+# HoneyPot Agent
 
-A stateful, agentic honeypot that detects scam intent, engages with a controlled persona, extracts structured intelligence, and concludes the session safely. The system is built around a single API endpoint, strict session lifecycle rules, and deterministic state transitions.
+<div align="center">
 
-## Why it is useful
+[![Python](https://img.shields.io/badge/Python-3.11+-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-API-009688?style=for-the-badge&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
+[![Pytest](https://img.shields.io/badge/Tests-pytest-0A9EDC?style=for-the-badge&logo=pytest&logoColor=white)](https://docs.pytest.org/)
+[![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?style=for-the-badge&logo=docker&logoColor=white)](https://docs.docker.com/compose/)
+[![Redis](https://img.shields.io/badge/Redis-Session_Store-DC382D?style=for-the-badge&logo=redis&logoColor=white)](https://redis.io/)
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-Persistence-4169E1?style=for-the-badge&logo=postgresql&logoColor=white)](https://www.postgresql.org/)
 
-- Keeps scammer engagement controlled and explainable
-- Extracts actionable intelligence (UPI IDs, phone numbers, phishing links)
-- Enforces session immutability and exactly-once final callbacks
-- Optional, redacted intelligence export for display and audits
+</div>
 
-## Architecture at a glance
+Stateful, agentic honeypot backend for scam engagement. The service receives incoming scammer messages, detects scam intent, transitions through a deterministic agent state machine, extracts intelligence via regex, and triggers a final callback exactly once when the session exits.
 
-- API layer: FastAPI endpoint for incoming messages
-- Session manager: append-only state, terminal flags, per-session locking
-- Detection: scam scoring and confidence tracking
-- Agent controller: deterministic state machine
-- Reply service: persona-driven responses (template or LLM)
-- Intelligence extraction: regex-based, deduplicated
-- Final callback: exactly-once dispatch on EXIT
+## Key Capabilities
 
-## Quickstart
+- Single public API endpoint for multi-turn engagement
+- Strict per-session lifecycle with terminal closure rules
+- Deterministic agent behavior driven by agent state
+- Regex-only intelligence extraction with deduplication
+- Exactly-once final callback dispatch on EXIT
+- Optional redacted intelligence snapshot export
+- Pluggable session store: in-memory or Redis + Postgres
 
-1. Create a virtual environment and install dependencies.
+## Project Structure
 
+```text
+.
+|- app/
+|  |- main.py                     # FastAPI app and request orchestration
+|  |- agent/
+|  |  |- controller.py            # State machine and transition signals
+|  |  |- reply_service.py         # Persona/state-based reply generation
+|  |- core/
+|  |  |- scam_detection.py        # Scam detection scoring
+|  |  |- intelligence.py          # Regex intelligence extraction
+|  |  |- session.py               # Session schema and lifecycle manager
+|  |- infrastructure/
+|     |- session_store.py         # Memory / Redis+Postgres store wiring
+|     |- callbacks.py             # Final callback dispatcher
+|     |- intel_exporter.py        # Redacted export writer
+|- docs/                          # Authoritative architecture and contracts
+|- tests/                         # Pytest suite
+|- tools/streamlit_app.py         # Streamlit test harness
+|- docker-compose.yml
+|- Dockerfile
+|- requirements.txt
 ```
+
+## API Summary
+
+### Endpoint
+
+- Method: POST
+- Path: /honeypot/message
+- Auth header: x-api-key
+
+### Request (shape)
+
+```json
+{
+  "sessionId": "optional-session-id",
+  "message": {
+    "sender": "scammer",
+    "text": "Your account is blocked. Verify now.",
+    "timestamp": 1738972800000
+  },
+  "conversationHistory": [],
+  "metadata": {
+    "channel": "WhatsApp",
+    "language": "English",
+    "locale": "IN"
+  }
+}
+```
+
+### Response (current runtime model)
+
+```json
+{
+  "status": "success",
+  "reply": "I am not sure. What should I do now?"
+}
+```
+
+When a session is closed, the endpoint returns HTTP 409 with session summary details.
+
+### Health Check
+
+- GET /health
+- POST /health
+- HEAD /health
+
+## Quick Start (Local)
+
+1. Create and activate a virtual environment.
+
+```bash
 python -m venv venv
 venv\Scripts\activate
+```
+
+2. Install dependencies.
+
+```bash
 pip install -r requirements.txt
 ```
 
-2. Configure environment variables.
+3. Configure environment variables.
 
-- Copy `.env.example` to `.env`
-- Set `HONEYPOT_API_KEY`
-- Set `FINAL_CALLBACK_URL`
-- (Optional) Enable `INTEL_EXPORT_ENABLED`
-
-3. Run the API server.
-
+```bash
+copy .env.example .env
 ```
+
+At minimum set:
+
+- HONEYPOT_API_KEY
+- FINAL_CALLBACK_URL
+- CALLBACK_API_KEY (if your callback endpoint requires it)
+
+4. Start the API.
+
+```bash
 python -m app.main
 ```
 
-4. Send a request.
+5. Send a test request.
 
-```
+```bash
 curl -X POST http://127.0.0.1:8000/honeypot/message \
   -H "Content-Type: application/json" \
-  -H "x-api-key: <YOUR_API_KEY>" \
-  -d "{\"sessionId\": \"demo-1\", \"message\": {\"sender\": \"scammer\", \"text\": \"Your account is blocked, verify now\", \"timestamp\": 1738972800000}}"
+  -H "x-api-key: YOUR_SECRET_API_KEY" \
+  -d "{\"sessionId\":\"demo-1\",\"message\":{\"sender\":\"scammer\",\"text\":\"Your KYC is blocked. Share UPI now\",\"timestamp\":1738972800000}}"
 ```
 
-## Docker Compose
+## Run with Docker Compose
 
-Run the API with Redis and Postgres using Docker Compose:
-
-```
+```bash
 docker compose up --build
 ```
 
-Notes:
+Compose provisions:
 
-- Compose sets `SESSION_STORE=redis_postgres` and wires Redis/Postgres automatically.
-- Update `.env` to set `HONEYPOT_API_KEY` and any callback settings before running.
-- Exported intelligence snapshots are persisted to `./exports`.
+- App on port 8000
+- Redis session layer
+- Postgres persistence
 
-## Optional display export
+Intelligence exports are written to exports/intel_snapshots.jsonl when enabled.
 
-Set these variables to write redacted intelligence snapshots to JSONL:
+## Environment Variables
 
-- `INTEL_EXPORT_ENABLED=true`
-- `INTEL_EXPORT_PATH=exports/intel_snapshots.jsonl`
-- `INTEL_EXPORT_MAX_SAMPLES=5`
+Use .env.example as the source of truth. Important variables include:
 
-Each line contains counts and redacted samples only.
+- ENVIRONMENT
+- HONEYPOT_API_KEY
+- SESSION_STORE (memory or redis_postgres)
+- REDIS_URL
+- POSTGRES_DSN
+- FINAL_CALLBACK_URL
+- CALLBACK_API_KEY
+- USE_LLM, LLM_BACKEND, STRICT_LLM_MODE
+- OPENAI_API_KEY / GEMINI_API_KEY (when using cloud LLM backends)
+- INTEL_EXPORT_ENABLED, INTEL_EXPORT_PATH, INTEL_EXPORT_MAX_SAMPLES
 
-## Demo UI
+## Testing
 
-A Streamlit tester is available in [tools/streamlit_app.py](tools/streamlit_app.py).
-
+```bash
+pytest -v
 ```
+
+## Streamlit Tester
+
+```bash
 streamlit run tools/streamlit_app.py
 ```
 
-## Tests
+## Reference Docs
 
-```
-pytest
-```
+- docs/PLAN.md
+- docs/SESSION_SCHEMA.md
+- docs/AGENT_STATE_MACHINE.md
+- docs/INTELLIGENCE_EXTRACTION_RULES.md
+- docs/API_CONTRACT.md
+- docs/IMPLEMENTATION_FLOW.md
 
-## Docs
+## Security and Operational Notes
 
-- Architecture plan: [docs/PLAN.md](docs/PLAN.md)
-- Session schema: [docs/SESSION_SCHEMA.md](docs/SESSION_SCHEMA.md)
-- Agent state machine: [docs/AGENT_STATE_MACHINE.md](docs/AGENT_STATE_MACHINE.md)
-- Intelligence extraction rules: [docs/INTELLIGENCE_EXTRACTION_RULES.md](docs/INTELLIGENCE_EXTRACTION_RULES.md)
-- API contract: [docs/API_CONTRACT.md](docs/API_CONTRACT.md)
-- Implementation flow: [docs/IMPLEMENTATION_FLOW.md](docs/IMPLEMENTATION_FLOW.md)
+- Keep sessions append-only and respect terminal flags
+- Do not expose callback endpoints publicly without authentication
+- Avoid logging raw sensitive intelligence values
+- Prefer Redis + Postgres for durable deployments
 
-## Production notes
+## License
 
-- Configure a durable session store (Redis) if needed
-- Enforce TLS and rate limiting at the gateway
-- Keep the callback endpoint private and authenticated
-- Avoid logging raw extracted values
-- Use Redis + Postgres for durable sessions in production
+No explicit license file is currently present in this repository.

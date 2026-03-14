@@ -12,7 +12,6 @@ COPY app ./app
 COPY tools ./tools
 COPY docs ./docs
 COPY README.md ./README.md
-COPY explain.md ./explain.md
 
 EXPOSE 8000
 
